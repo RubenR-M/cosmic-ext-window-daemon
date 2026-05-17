@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 
+[lib]
+name = "cosmic_ext_window_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cosmic-ext-window-daemon"
 path = "src/main.rs"
+
+[dev-dependencies]
+trybuild = "1"
 
 [dependencies]
 cosmic-protocols = "=0.2.0"

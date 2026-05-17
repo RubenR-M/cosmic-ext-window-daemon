@@ -1,0 +1,36 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/compile_fail/workspace_tx_cannot_store_reference.rs:25:9
+   |
+19 |     let mut outer: Option<&mut WorkspaceTx<'outer>> = None;
+   |         --------- `outer` declared here, outside of the closure body
+20 |
+21 |     let _ = manager.transaction(|tx: &mut WorkspaceTx<'_>| -> Result<(), WorkspaceTxError> {
+   |                                  -- `tx` is a reference that is only valid in the closure body
+...
+25 |         outer = Some(tx);
+   |         ^^^^^^^^^^^^^^^^ `tx` escapes the closure body here
+
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/compile_fail/workspace_tx_cannot_store_reference.rs:25:9
+   |
+19 |     let mut outer: Option<&mut WorkspaceTx<'outer>> = None;
+   |         --------- `outer` declared here, outside of the closure body
+20 |
+21 |     let _ = manager.transaction(|tx: &mut WorkspaceTx<'_>| -> Result<(), WorkspaceTxError> {
+   |                                  -- `tx` is a reference that is only valid in the closure body
+...
+25 |         outer = Some(tx);
+   |         ^^^^^^^^^^^^^^^^ `tx` escapes the closure body here
+   |
+   = note: requirement occurs because of a mutable reference to `WorkspaceTx<'_>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+  --> tests/compile_fail/workspace_tx_cannot_store_reference.rs:25:22
+   |
+16 | fn attempt_outer_storage<'outer>(manager: &'outer WorkspaceManager<'outer>) {
+   |                          ------ lifetime `'outer` defined here
+...
+25 |         outer = Some(tx);
+   |                      ^^ this usage requires that `'outer` must outlive `'static`

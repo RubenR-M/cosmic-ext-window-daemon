@@ -1,17 +1,10 @@
-// cosmic-ext-window-daemon
+// cosmic-ext-window-daemon — binary entry point.
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// D15 Layer 2: the #![deny(clippy::disallowed_methods)] attribute is added in PR 2 (T-010)
-// once the CI gate is in place to enforce it. The disallowed-methods list in clippy.toml
-// is already active at warn level — that wiring is established in PR 1a.
-
-mod config;
-mod ids;
-mod placement;
-mod reconnect;
-mod state;
-mod verify;
-mod wayland;
+// D15 Layer 2: `#![deny(clippy::disallowed_methods)]` is added in T-010
+// alongside the CI gate (T-011) and the SC-018 test PR (T-012). The
+// `#![allow(clippy::disallowed_methods)]` inner attribute on
+// `wayland::workspace` in the library crate is the sole authorized exception.
 
 fn main() {
     todo!("implement main entrypoint — T-021")
