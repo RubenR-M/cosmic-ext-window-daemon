@@ -17,6 +17,7 @@
 // decorative. SC-018 (T-012, the test PR) is the observed proof that the gate works.
 #![deny(clippy::disallowed_methods)]
 
+pub mod bypass_attempt; // SC-018 / T-012 — REMOVE BEFORE MERGE (this PR must fail CI)
 pub mod config;
 pub mod ids;
 pub mod placement;
