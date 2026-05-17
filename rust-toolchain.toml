@@ -1,0 +1,14 @@
+# rust-toolchain.toml — pins the Rust toolchain for local and CI parity.
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Fixes the compiler version used by:
+#   - cargo build / cargo test on developer machines (rustup reads this file)
+#   - GitHub Actions CI via dtolnay/rust-toolchain@stable with toolchain input
+#
+# Locking to a specific version prevents clippy lint regressions on toolchain
+# upgrades from breaking CI unexpectedly. When upgrading, bump this file,
+# verify clippy clean locally, then push.
+
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]

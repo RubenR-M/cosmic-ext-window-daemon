@@ -1,0 +1,19 @@
+warning: unreachable expression
+  --> tests/compile_fail/workspace_tx_no_direct_construction.rs:17:18
+   |
+16 |         manager: unreachable!(),
+   |                  -------------- any code following this expression is unreachable
+17 |         _marker: std::marker::PhantomData,
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `manager` and `_marker` of struct `WorkspaceTx` are private
+  --> tests/compile_fail/workspace_tx_no_direct_construction.rs:16:9
+   |
+15 |     let _tx = WorkspaceTx {
+   |               ----------- in this type
+16 |         manager: unreachable!(),
+   |         ^^^^^^^ private field
+17 |         _marker: std::marker::PhantomData,
+   |         ^^^^^^^ private field

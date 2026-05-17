@@ -1,0 +1,35 @@
+error: lifetime may not live long enough
+  --> tests/compile_fail/workspace_tx_cannot_escape_closure.rs:33:30
+   |
+33 |     manager.transaction(|tx| Ok(Smuggler(tx)))
+   |                          --- ^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                          | |
+   |                          | return type of closure is Result<Smuggler<'2, '_>, WorkspaceTxError>
+   |                          has type `&'1 mut WorkspaceTx<'_>`
+
+error: lifetime may not live long enough
+  --> tests/compile_fail/workspace_tx_cannot_escape_closure.rs:33:30
+   |
+33 |     manager.transaction(|tx| Ok(Smuggler(tx)))
+   |                          --- ^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'4`
+   |                          | |
+   |                          | return type of closure is Result<Smuggler<'_, '4>, WorkspaceTxError>
+   |                          has type `&mut WorkspaceTx<'3>`
+   |
+   = note: requirement occurs because of the type `Smuggler<'_, '_>`, which makes the generic argument `'_` invariant
+   = note: the struct `Smuggler<'a, 'tx>` is invariant over the parameter `'tx`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+  --> tests/compile_fail/workspace_tx_cannot_escape_closure.rs:33:30
+   |
+26 | fn try_to_smuggle<'a>(
+   |                   -- lifetime `'a` defined here
+...
+33 |     manager.transaction(|tx| Ok(Smuggler(tx)))
+   |                              ^^^^^^^^^^^^^^^^ returning this value requires that `'a` must outlive `'static`
+   |
+help: consider adding 'move' keyword before the nested closure
+   |
+33 |     manager.transaction(move |tx| Ok(Smuggler(tx)))
+   |                         ++++
