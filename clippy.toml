@@ -1,0 +1,25 @@
+# clippy.toml — D15 Layer 2 lint prep (PR 1a)
+#
+# These disallowed-methods entries forbid direct calls to workspace-state-mutating
+# protocol methods outside of `wayland::workspace::WorkspaceManager::transaction`.
+#
+# The crate root (`src/main.rs`) WILL carry `#![deny(clippy::disallowed_methods)]`
+# in PR 2 (T-010) — intentionally absent in this PR. `src/wayland/workspace.rs`
+# already carries `#![allow(clippy::disallowed_methods)]` at module scope; once
+# the deny activates in PR 2, that allow makes `wayland::workspace` the sole
+# authorized call site for the methods listed below.
+#
+# Paths verified against wayland-protocols-0.32.12 (resolved from wayland-protocols = "0.32"
+# with the `staging` feature), which is compatible with the 0.32.10 tarball examined in
+# the proposal verification log (§9). The ext-workspace staging protocol paths are
+# identical across the 0.32.x series.
+#
+# The CI gate (`cargo clippy -- -D warnings` as a required merge check) is configured
+# in Phase 2 (T-011). Until that gate exists, this lint is present-but-warn, serving as
+# documentation of intent and wiring the plumbing for Phase 2 enforcement.
+
+disallowed-methods = [
+    { path = "wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1::ExtWorkspaceHandleV1::activate", reason = "use wayland::workspace::WorkspaceManager::transaction instead — raw activate() without commit() is a silent no-op; see D15" },
+    { path = "wayland_protocols::ext::workspace::v1::client::ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1::create_workspace", reason = "use wayland::workspace::WorkspaceManager::transaction instead — raw create_workspace() without commit() is a silent no-op; see D15" },
+    { path = "wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::ExtWorkspaceManagerV1::commit", reason = "only WorkspaceManager::transaction may call commit() — direct commit() calls bypass the transaction boundary; see D15" },
+]
