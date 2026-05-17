@@ -92,6 +92,9 @@ pub struct AppData {
     pub warn_workspace_output_fallback: AtomicBool,
     /// FR-014: new-each not supported on this compositor; degraded to next-free.
     pub warn_new_each_unsupported: AtomicBool,
+    /// FR-014 (second variant): create_workspace was issued but the compositor
+    /// did not produce a new workspace within one dispatch cycle; degraded.
+    pub warn_create_workspace_not_honored: AtomicBool,
 
     // -----------------------------------------------------------------------
     // Calloop loop infrastructure
@@ -111,6 +114,12 @@ pub struct AppData {
 
     /// Monotonic counter for NewEach workspace name fallback when app_id is empty (Q1).
     pub new_each_counter: u64,
+
+    /// FR-014 pending-placement queue: NewEach mode pushes a PendingPlacement
+    /// after create_workspace + commit, then waits up to one
+    /// WorkspaceHandler::done() cycle for the new workspace to appear before
+    /// degrading to next-free placement.
+    pub pending_placements: Vec<crate::runtime::PendingPlacement>,
 
     /// LoopSignal cached here so signal handlers can call stop() cleanly.
     pub loop_signal: calloop::LoopSignal,
@@ -134,6 +143,17 @@ impl AppData {
         if !self.warn_new_each_unsupported.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 "`new-each` not supported on this compositor; degraded to `next-free`"
+            );
+        }
+    }
+
+    /// Emit WARN-once-per-process for the FR-014 second variant: the compositor
+    /// did NOT produce a new workspace within one dispatch cycle after
+    /// create_workspace + commit. The placement was degraded to next-free.
+    pub fn warn_once_create_workspace_not_honored(&self) {
+        if !self.warn_create_workspace_not_honored.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "`create_workspace` did not produce a new workspace; degraded to `next-free`"
             );
         }
     }

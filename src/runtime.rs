@@ -23,10 +23,94 @@ use std::collections::HashSet;
 use wayland_client::Proxy as _;
 
 use crate::placement::{
-    decide, PlacementAction, PlacementWarn, SkipReason, ToplevelInfoStub,
+    decide, PlacementAction, PlacementWarn, PostPlaceActions, SkipReason, ToplevelInfoStub,
     WorkspaceGroupStub, WorkspaceStateStub, WorkspaceStub, WorkspaceTarget,
 };
-use crate::wayland::workspace::{first_empty_workspace_in_group, WorkspaceManager};
+use crate::wayland::workspace::WorkspaceManager;
+
+// ---------------------------------------------------------------------------
+// FR-014 — Pending placements queue
+//
+// WORKSPACE_MODE=new-each issues create_workspace + commit; the new workspace
+// becomes visible on the NEXT WorkspaceHandler::done() dispatch, not synchronously.
+// Placing synchronously on a fallback workspace silently violates FR-014's
+// "wait one dispatch cycle" semantics. Instead, push to this queue, scan on
+// done() events, and either land on the new workspace (success) or degrade
+// with a WARN-once-per-process (compositor did not honor the request).
+// ---------------------------------------------------------------------------
+
+/// A placement deferred until the compositor reports the new workspace (or
+/// until we've waited long enough to declare the create_workspace request
+/// unanswered).
+pub struct PendingPlacement {
+    pub cosmic_toplevel: cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
+    pub group_handle: wayland_protocols::ext::workspace::v1::client::ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
+    pub output: wayland_client::protocol::wl_output::WlOutput,
+    /// Snapshot of workspace handle ObjectIds in the group BEFORE create_workspace.
+    /// Used to detect the appearance of a new handle.
+    pub workspace_ids_before: HashSet<wayland_client::backend::ObjectId>,
+    pub then: PostPlaceActions,
+    pub app_id: String,
+    pub cycles_waited: u32,
+}
+
+/// Pure-logic outcome of evaluating a single pending placement against the
+/// current world state. Decoupled from Wayland types so it can be unit-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDecision {
+    /// A new workspace appeared in the group; the caller looks up its handle
+    /// by the given index into the current-group-workspaces list.
+    UseNew { idx: usize },
+    /// One dispatch cycle elapsed without a new workspace appearing.
+    /// Degrade to next-free at the given index (or None if the group has no
+    /// empty workspaces — caller skips with a WARN).
+    DegradeAndWarn { next_free_idx: Option<usize> },
+    /// First scan — still on cycle 0. Leave in the queue.
+    KeepWaiting,
+}
+
+/// Pure-logic decision: given the snapshot and the current state of the
+/// pending placement's group, decide what to do.
+///
+/// Inputs:
+/// - `workspace_ids_before`: snapshot from PendingPlacement.
+/// - `current_workspace_ids_in_group`: workspace handle IDs currently in the
+///   group, in stable order.
+/// - `current_workspace_occupied`: parallel array — true if the workspace
+///   has any toplevel referencing it.
+/// - `cycles_waited`: how many WorkspaceHandler::done() events have fired
+///   since the create_workspace was issued.
+pub fn evaluate_pending<Id: Eq + std::hash::Hash + Clone>(
+    workspace_ids_before: &HashSet<Id>,
+    current_workspace_ids_in_group: &[Id],
+    current_workspace_occupied: &[bool],
+    cycles_waited: u32,
+) -> PendingDecision {
+    debug_assert_eq!(
+        current_workspace_ids_in_group.len(),
+        current_workspace_occupied.len(),
+        "evaluate_pending: workspace and occupancy slices must have equal length",
+    );
+
+    // Look for a workspace handle that wasn't in the snapshot.
+    let new_idx = current_workspace_ids_in_group
+        .iter()
+        .position(|id| !workspace_ids_before.contains(id));
+
+    if let Some(idx) = new_idx {
+        return PendingDecision::UseNew { idx };
+    }
+
+    // No new workspace appeared. If we've already waited one cycle, degrade.
+    // FR-014: "After one event-loop dispatch cycle, if no new workspace is
+    // visible in WorkspaceState, the daemon MUST degrade to next-free."
+    if cycles_waited >= 1 {
+        let next_free_idx = current_workspace_occupied.iter().position(|occ| !*occ);
+        return PendingDecision::DegradeAndWarn { next_free_idx };
+    }
+
+    PendingDecision::KeepWaiting
+}
 
 // ---------------------------------------------------------------------------
 // Stub builders — convert real Wayland types to pure-logic stubs.
@@ -209,10 +293,13 @@ fn execute_place(
             }
         }
         WorkspaceTarget::Create => {
-            // FR-014: create_workspace + commit on the target group, then find
-            // the new workspace. The compositor's new-workspace event arrives
-            // asynchronously — handle that in a follow-up commit
-            // (currently degrades immediately to next-free).
+            // FR-014: create_workspace + commit on the target group, then DEFER
+            // placement until the compositor reports the new workspace (or until
+            // one dispatch cycle has elapsed without it appearing — degrade).
+            //
+            // The placement does NOT happen synchronously here — it is pushed to
+            // app.pending_placements and resolved by scan_pending_placements()
+            // on the next WorkspaceHandler::done() event.
             let target_output_id = output.id().protocol_id() as u64;
             let group_handle = match app
                 .workspace_state
@@ -236,6 +323,25 @@ fn execute_place(
                 info.app_id.clone()
             };
 
+            // Snapshot the current workspace handle IDs in the target group so
+            // scan_pending_placements can detect the NEW handle when it appears.
+            let group_for_snapshot = app
+                .workspace_state
+                .workspace_groups()
+                .find(|g| g.handle == group_handle)
+                .cloned();
+
+            let workspace_ids_before: HashSet<wayland_client::backend::ObjectId> =
+                match &group_for_snapshot {
+                    Some(g) => app
+                        .workspace_state
+                        .workspaces()
+                        .filter(|w| g.workspaces.contains(&w.handle))
+                        .map(|w| w.handle.id())
+                        .collect(),
+                    None => HashSet::new(),
+                };
+
             // Issue create_workspace + commit via WorkspaceManager::transaction (Constraint E).
             let manager = WorkspaceManager::from_state(&app.workspace_state)
                 .map_err(|e| anyhow::anyhow!("workspace manager unavailable: {}", e))?;
@@ -247,30 +353,24 @@ fn execute_place(
                 })
                 .map_err(|e| anyhow::anyhow!("create_workspace failed: {}", e))?;
 
-            // Immediate degrade to first-empty-in-group as the placement target for
-            // THIS event. The newly-created workspace becomes visible on the next
-            // dispatch cycle; honoring FR-014's "wait one cycle" semantics is the
-            // pending-placement-queue work landing in a follow-up commit.
-            let group_info = app
-                .workspace_state
-                .workspace_groups()
-                .find(|g| g.handle == group_handle)
-                .cloned();
+            // Push pending placement. scan_pending_placements() on the next
+            // WorkspaceHandler::done() will land it on the new workspace if one
+            // appears, or degrade to next-free with WARN-once if not.
+            app.pending_placements.push(PendingPlacement {
+                cosmic_toplevel: cosmic_handle,
+                group_handle,
+                output,
+                workspace_ids_before,
+                then,
+                app_id: info.app_id.clone(),
+                cycles_waited: 0,
+            });
 
-            let fallback = group_info
-                .as_ref()
-                .and_then(|g| {
-                    first_empty_workspace_in_group(&app.workspace_state, &app.toplevel_info_state, g)
-                })
-                .map(|w| w.handle.clone());
-
-            match fallback {
-                Some(h) => h,
-                None => {
-                    tracing::warn!(app_id = %info.app_id, "create_workspace did not produce a new workspace; no fallback available; skipping");
-                    return Ok(());
-                }
-            }
+            tracing::debug!(
+                app_id = %info.app_id,
+                "pending placement queued for WORKSPACE_MODE=new-each; awaiting WorkspaceHandler::done"
+            );
+            return Ok(());
         }
     };
 
@@ -380,5 +480,281 @@ fn emit_verify_event(
                 "compositor does not appear to be honoring workspace activation at all — distinct activations attempted, none confirmed"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FR-014 scan loop: drain pending placements on WorkspaceHandler::done
+// ---------------------------------------------------------------------------
+
+/// Walk `app.pending_placements`, evaluate each, and either complete the
+/// placement on a new workspace (success) or degrade to next-free with
+/// WARN-once-per-process (compositor did not honor `create_workspace`).
+///
+/// Called from `WorkspaceHandler::done` (the toolkit's batch-completion event).
+/// Each invocation counts as one dispatch cycle of waiting.
+pub fn scan_pending_placements(app: &mut crate::state::AppData) {
+    if app.pending_placements.is_empty() {
+        return;
+    }
+
+    let mut i = 0;
+    while i < app.pending_placements.len() {
+        // Increment cycle counter FIRST: this scan call counts as one cycle.
+        app.pending_placements[i].cycles_waited += 1;
+
+        // Snapshot the group's current workspaces.
+        let group_info = app
+            .workspace_state
+            .workspace_groups()
+            .find(|g| g.handle == app.pending_placements[i].group_handle)
+            .cloned();
+
+        let group = match group_info {
+            Some(g) => g,
+            None => {
+                tracing::warn!(
+                    app_id = %app.pending_placements[i].app_id,
+                    "workspace group disappeared while pending placement was queued; dropping"
+                );
+                app.pending_placements.swap_remove(i);
+                continue;
+            }
+        };
+
+        let current_ids: Vec<wayland_client::backend::ObjectId> = app
+            .workspace_state
+            .workspaces()
+            .filter(|w| group.workspaces.contains(&w.handle))
+            .map(|w| w.handle.id())
+            .collect();
+
+        let occupied_set: HashSet<wayland_client::backend::ObjectId> = app
+            .toplevel_info_state
+            .toplevels()
+            .flat_map(|t| t.workspace.iter().map(|w| w.id()))
+            .collect();
+
+        let current_occupied: Vec<bool> =
+            current_ids.iter().map(|id| occupied_set.contains(id)).collect();
+
+        let decision = evaluate_pending(
+            &app.pending_placements[i].workspace_ids_before,
+            &current_ids,
+            &current_occupied,
+            app.pending_placements[i].cycles_waited,
+        );
+
+        match decision {
+            PendingDecision::KeepWaiting => {
+                i += 1;
+            }
+            PendingDecision::UseNew { idx } => {
+                let target_id = current_ids[idx].clone();
+                let target_handle = app
+                    .workspace_state
+                    .workspaces()
+                    .find(|w| w.handle.id() == target_id)
+                    .map(|w| w.handle.clone());
+
+                let pending = app.pending_placements.swap_remove(i);
+
+                match target_handle {
+                    Some(h) => execute_deferred_place(
+                        app,
+                        &pending.cosmic_toplevel,
+                        &h,
+                        &pending.output,
+                        &pending.then,
+                        &pending.app_id,
+                    ),
+                    None => {
+                        tracing::warn!(
+                            app_id = %pending.app_id,
+                            "new workspace handle vanished between scan and place; dropping"
+                        );
+                    }
+                }
+                // Do NOT increment i — swap_remove brought a new pending into [i].
+            }
+            PendingDecision::DegradeAndWarn { next_free_idx } => {
+                app.warn_once_create_workspace_not_honored();
+
+                let target_handle = next_free_idx.and_then(|idx| {
+                    let id = current_ids[idx].clone();
+                    app.workspace_state
+                        .workspaces()
+                        .find(|w| w.handle.id() == id)
+                        .map(|w| w.handle.clone())
+                });
+
+                let pending = app.pending_placements.swap_remove(i);
+
+                match target_handle {
+                    Some(h) => execute_deferred_place(
+                        app,
+                        &pending.cosmic_toplevel,
+                        &h,
+                        &pending.output,
+                        &pending.then,
+                        &pending.app_id,
+                    ),
+                    None => {
+                        tracing::warn!(
+                            app_id = %pending.app_id,
+                            "create_workspace did not produce a new workspace and group has no empty fallback; skipping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Execute the move + activate + maximize sequence on a target workspace handle
+/// that was resolved from a pending placement (FR-014 deferred path).
+///
+/// Same shape as the synchronous Existing-target path in `execute_place`, but
+/// extracted so both call sites can share it.
+fn execute_deferred_place(
+    app: &mut crate::state::AppData,
+    cosmic_handle: &cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
+    target_ws: &wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1::ExtWorkspaceHandleV1,
+    output: &wayland_client::protocol::wl_output::WlOutput,
+    then: &PostPlaceActions,
+    app_id: &str,
+) {
+    crate::wayland::management::move_toplevel(app, cosmic_handle, target_ws, output);
+
+    if then.switch_to {
+        if let Err(e) = register_activate_with_verification(app, target_ws) {
+            tracing::warn!(error = %e, "deferred activate failed");
+        }
+    }
+
+    if then.maximize {
+        crate::wayland::management::set_maximized(app, cosmic_handle);
+    }
+
+    tracing::info!(
+        app_id = %app_id,
+        workspace_id = target_ws.id().protocol_id(),
+        switch = then.switch_to,
+        maximize = then.maximize,
+        "deferred placement on workspace completed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure-logic evaluation of pending-placement decision
+// (the scan_pending_placements + execute_deferred_place glue is tested
+// only by the type system + manual live-compositor verification per FR-OOS-008)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn ids(values: &[u32]) -> Vec<u32> {
+        values.to_vec()
+    }
+
+    fn snapshot(values: &[u32]) -> HashSet<u32> {
+        values.iter().copied().collect()
+    }
+
+    #[test]
+    fn evaluate_pending_keeps_waiting_on_cycle_zero_with_no_new_workspace() {
+        // Just after push: cycles_waited=0, no new workspace yet → KeepWaiting.
+        let before = snapshot(&[10, 20]);
+        let current = ids(&[10, 20]);
+        let occupied = vec![true, true];
+        assert_eq!(
+            evaluate_pending(&before, &current, &occupied, 0),
+            PendingDecision::KeepWaiting,
+        );
+    }
+
+    #[test]
+    fn evaluate_pending_finds_new_workspace_on_first_cycle() {
+        // After first done(): cycles_waited=1, a new workspace (30) appeared.
+        // UseNew with the index of the new workspace.
+        let before = snapshot(&[10, 20]);
+        let current = ids(&[10, 20, 30]);
+        let occupied = vec![true, true, false];
+        assert_eq!(
+            evaluate_pending(&before, &current, &occupied, 1),
+            PendingDecision::UseNew { idx: 2 },
+        );
+    }
+
+    #[test]
+    fn evaluate_pending_finds_new_workspace_even_on_cycle_zero() {
+        // If the compositor delivered the new workspace IMMEDIATELY (cycles_waited=0
+        // because the scan was triggered before the increment), still use it.
+        // Note: in production scan_pending_placements increments cycles_waited
+        // FIRST, so cycles_waited >= 1 at evaluate time. This test pins behavior
+        // for the boundary case where a caller happens to evaluate at cycle 0.
+        let before = snapshot(&[10, 20]);
+        let current = ids(&[10, 20, 30]);
+        let occupied = vec![true, true, false];
+        assert_eq!(
+            evaluate_pending(&before, &current, &occupied, 0),
+            PendingDecision::UseNew { idx: 2 },
+        );
+    }
+
+    #[test]
+    fn evaluate_pending_degrades_after_one_cycle_with_no_new_workspace() {
+        // After first done(): cycles_waited=1, no new workspace → degrade.
+        // next-free is index 0 (the only empty workspace).
+        let before = snapshot(&[10, 20, 30]);
+        let current = ids(&[10, 20, 30]);
+        let occupied = vec![false, true, true];
+        assert_eq!(
+            evaluate_pending(&before, &current, &occupied, 1),
+            PendingDecision::DegradeAndWarn { next_free_idx: Some(0) },
+        );
+    }
+
+    #[test]
+    fn evaluate_pending_degrades_with_no_fallback_when_group_fully_occupied() {
+        // No new workspace, no empty fallback either — caller will skip with a WARN.
+        let before = snapshot(&[10, 20]);
+        let current = ids(&[10, 20]);
+        let occupied = vec![true, true];
+        assert_eq!(
+            evaluate_pending(&before, &current, &occupied, 1),
+            PendingDecision::DegradeAndWarn { next_free_idx: None },
+        );
+    }
+
+    #[test]
+    fn evaluate_pending_picks_first_new_when_multiple_appeared() {
+        // If the compositor created multiple workspaces in one cycle, use the
+        // first one in iteration order (deterministic per the workspace_state
+        // iterator's order).
+        let before = snapshot(&[10]);
+        let current = ids(&[10, 30, 31]);
+        let occupied = vec![true, false, false];
+        assert_eq!(
+            evaluate_pending(&before, &current, &occupied, 1),
+            PendingDecision::UseNew { idx: 1 }, // first new at index 1
+        );
+    }
+
+    #[test]
+    fn evaluate_pending_treats_re_use_of_old_handle_as_no_new_workspace() {
+        // Edge case: a workspace from the snapshot was removed AND a new one
+        // appeared but with an ID we'd already seen — shouldn't happen in
+        // practice (handles are not reused within a session) but defensive.
+        let before = snapshot(&[10, 20, 30]);
+        let current = ids(&[10, 20]); // 30 disappeared, no new ones
+        let occupied = vec![true, true];
+        assert_eq!(
+            evaluate_pending(&before, &current, &occupied, 1),
+            PendingDecision::DegradeAndWarn { next_free_idx: None },
+        );
     }
 }

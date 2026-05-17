@@ -239,6 +239,12 @@ impl WorkspaceHandler for AppData {
             }
             self.verifier.record_confirm(handle_id);
         }
+
+        // FR-014: drain pending placements queued by WORKSPACE_MODE=new-each.
+        // Each done() event counts as one dispatch cycle of waiting. The first
+        // scan after push either lands on the newly-created workspace or
+        // degrades to next-free with a WARN-once-per-process.
+        crate::runtime::scan_pending_placements(self);
     }
 }
 
