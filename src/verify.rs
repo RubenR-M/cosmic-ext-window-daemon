@@ -67,7 +67,19 @@ pub struct VerifierState {
 
 impl VerifierState {
     /// Create a new verifier with the given warn threshold (N=3 by default in production).
+    ///
+    /// `warn_threshold` MUST be >= 1. A threshold of 0 would make the WARN-once
+    /// trigger evaluate `attempted_distinct.len() >= 0` — trivially true — so the
+    /// very first timeout would emit WARN without any attempts having been made.
+    /// That degenerate state has no defensible interpretation under D9's two-tier
+    /// semantics, so we reject it at construction rather than smuggling it into
+    /// the state machine.
     pub fn new(warn_threshold: usize) -> Self {
+        assert!(
+            warn_threshold >= 1,
+            "VerifierState::new: warn_threshold must be >= 1 (got {}); a threshold of 0 would fire WARN on the first timeout with no prior attempts, which has no meaning under D9 Signal B",
+            warn_threshold,
+        );
         Self {
             pending: HashMap::new(),
             attempted_distinct: HashSet::new(),
@@ -86,6 +98,18 @@ impl VerifierState {
     pub fn record_attempt(&mut self, handle: WorkspaceId, timer_id: Option<TimerId>) {
         self.attempted_distinct.insert(handle);
         if let Some(tid) = timer_id {
+            // S4/S5: a second attempt for the SAME handle while a previous timer is
+            // still pending almost certainly indicates a caller-side correlation bug
+            // (Phase 3 forgot to cancel the prior timer before re-issuing). In release
+            // we tolerate it (insert overwrites), but debug builds fail loudly so the
+            // bug surfaces in tests instead of silently leaking timer state.
+            debug_assert!(
+                !self.pending.contains_key(&handle),
+                "record_attempt: handle {:?} already pending (caller likely forgot to cancel the prior timer before re-issuing activate); existing timer {:?}, new timer {:?}",
+                handle,
+                self.pending.get(&handle),
+                tid,
+            );
             self.pending.insert(handle, tid);
         }
     }
@@ -109,6 +133,17 @@ impl VerifierState {
     /// Signal A: INFO-once-per-handle
     /// Signal B: WARN-once-per-process (when !ever_confirmed && !process_warn_fired && distinct >= N)
     pub fn record_timeout(&mut self, handle: WorkspaceId) -> VerifyEvent {
+        // S4/S5: a timeout for a handle that was never recorded as an attempt
+        // is a caller-side correlation bug — Phase 3 wired a timer for a handle
+        // it didn't track. Release tolerates it (handle gets info_emitted, no
+        // WARN side-effect since attempted_distinct is unaffected by this call).
+        // Debug builds fail loudly so the bug surfaces in tests.
+        debug_assert!(
+            self.attempted_distinct.contains(&handle),
+            "record_timeout: handle {:?} timed out but was never recorded as an attempt (caller-side correlation bug — a timer fired for a handle that record_attempt was never called with)",
+            handle,
+        );
+
         self.pending.remove(&handle);
 
         let info_fired = self.info_emitted.insert(handle);
@@ -379,5 +414,46 @@ mod tests {
             matches!(e3, VerifyEvent::InfoAndWarn),
             "3rd distinct attempt+timeout: INFO + WARN expected, got {e3:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S6 — degenerate state guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "warn_threshold must be >= 1")]
+    fn verifier_new_panics_on_zero_warn_threshold() {
+        // warn_threshold = 0 has no defensible interpretation: the WARN check
+        // `attempted_distinct.len() >= 0` would be trivially true, firing WARN
+        // on the first timeout with no prior attempts. Construction must reject it.
+        let _ = VerifierState::new(0);
+    }
+
+    // -----------------------------------------------------------------------
+    // S4 / S5 — debug-asserts catch caller-side correlation bugs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "already pending")]
+    fn verifier_record_attempt_panics_on_duplicate_pending_handle_debug() {
+        // A second attempt for a handle whose previous timer is still pending
+        // indicates the caller forgot to cancel the prior timer. In debug builds
+        // we fail loudly to surface the bug in tests; in release we tolerate
+        // (insert overwrites). This test only runs in debug builds (cargo test).
+        let mut v = VerifierState::new(3);
+        v.record_attempt(1, Some(100));
+        // Caller bug: re-attempt without prior timer cancellation.
+        v.record_attempt(1, Some(101));
+    }
+
+    #[test]
+    #[should_panic(expected = "never recorded as an attempt")]
+    fn verifier_record_timeout_panics_on_unknown_handle_debug() {
+        // A timeout for a handle that was never recorded as an attempt indicates
+        // a caller-side timer-handle correlation bug. Debug builds catch this;
+        // release tolerates (no WARN side-effect because attempted_distinct is
+        // unchanged by this call).
+        let mut v = VerifierState::new(3);
+        v.record_timeout(99); // 99 was never an attempt
     }
 }
