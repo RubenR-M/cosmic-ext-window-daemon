@@ -93,14 +93,20 @@ fn parse_workspace_mode(val: Option<&str>) -> anyhow::Result<WorkspaceMode> {
 }
 
 fn parse_bool(var_name: &str, val: Option<&str>) -> anyhow::Result<bool> {
+    // POSIX-style admin env var convention: accept the obvious truthy/falsy
+    // spellings, case-insensitive, with surrounding whitespace tolerated.
+    // Anything else is a parse error so typos surface at startup (FR-004).
     match val {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => anyhow::bail!(
-            "{}: unrecognized value {:?}; expected \"0\" or \"1\"",
-            var_name,
-            other
-        ),
+        None => Ok(false),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => Ok(false),
+            "1" | "true" | "yes" | "on" => Ok(true),
+            other => anyhow::bail!(
+                "{}: unrecognized value {:?}; expected one of 0/1, true/false, yes/no, on/off (case-insensitive)",
+                var_name,
+                other
+            ),
+        },
     }
 }
 
@@ -219,15 +225,53 @@ mod tests {
     }
 
     #[test]
+    fn from_env_source_accepts_posix_truthy_spellings() {
+        // POSIX-style admin convention: true/yes/on/1, case-insensitive, whitespace tolerated.
+        for raw in ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON", "  1  ", "\ttrue\n"] {
+            let cfg = from_env_source(env(&[("MAXIMIZE", raw)])).unwrap_or_else(|e| {
+                panic!("expected {:?} to parse as true, got error: {}", raw, e);
+            });
+            assert!(cfg.maximize, "{:?} should parse as true", raw);
+        }
+    }
+
+    #[test]
+    fn from_env_source_accepts_posix_falsy_spellings() {
+        for raw in ["0", "false", "FALSE", "no", "NO", "off", "OFF", "  0  ", "\tfalse\n"] {
+            let cfg = from_env_source(env(&[("MAXIMIZE", raw)])).unwrap_or_else(|e| {
+                panic!("expected {:?} to parse as false, got error: {}", raw, e);
+            });
+            assert!(!cfg.maximize, "{:?} should parse as false", raw);
+        }
+    }
+
+    #[test]
     fn from_env_source_returns_err_when_maximize_is_invalid() {
-        let err = from_env_source(env(&[("MAXIMIZE", "yes")])).unwrap_err();
-        assert!(err.to_string().contains("MAXIMIZE"));
+        // After S2 expansion, only spellings outside the POSIX set are errors.
+        let err = from_env_source(env(&[("MAXIMIZE", "bogus")])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("MAXIMIZE"), "error should name the var: {}", msg);
+        assert!(
+            msg.contains("0/1") || msg.contains("true/false"),
+            "error should list accepted values: {}",
+            msg,
+        );
     }
 
     #[test]
     fn from_env_source_parses_switch_to_workspace_true() {
         let cfg = from_env_source(env(&[("SWITCH_TO_WORKSPACE", "1")])).unwrap();
         assert!(cfg.switch_to_workspace);
+    }
+
+    #[test]
+    fn from_env_source_switch_to_workspace_honors_posix_spellings() {
+        // Sanity check that SWITCH_TO_WORKSPACE goes through the same parser
+        // (no per-var hardcoding regressions).
+        let cfg = from_env_source(env(&[("SWITCH_TO_WORKSPACE", "yes")])).unwrap();
+        assert!(cfg.switch_to_workspace);
+        let cfg = from_env_source(env(&[("SWITCH_TO_WORKSPACE", "off")])).unwrap();
+        assert!(!cfg.switch_to_workspace);
     }
 
     // --- switch_verify_timeout ---
