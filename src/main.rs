@@ -6,6 +6,7 @@
 // is already active at warn level — that wiring is established in PR 1a.
 
 mod config;
+mod ids;
 mod placement;
 mod reconnect;
 mod state;
