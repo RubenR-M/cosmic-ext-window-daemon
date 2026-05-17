@@ -62,7 +62,20 @@ pub struct WorkspaceStub {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementAction {
     Skip { reason: SkipReason },
-    Place { workspace: WorkspaceId, then: PostPlaceActions },
+    Place { workspace: WorkspaceTarget, then: PostPlaceActions },
+}
+
+/// Where to place a toplevel within the selected workspace group.
+///
+/// `Existing` carries the WorkspaceId of an extant workspace. `Create` means
+/// the caller (Phase 3) must invoke `create_workspace` on the group manager.
+/// The enum makes the two cases distinct in the type system so a consumer
+/// CANNOT silently treat "create a new workspace" as if it were an existing
+/// workspace handle. Avoids the D9/D15-class brittleness of an integer sentinel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceTarget {
+    Existing(WorkspaceId),
+    Create,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,13 +149,13 @@ pub fn decide(
     };
 
     // FR-013 / FR-014 — select target workspace within group
-    let workspace_id = match select_workspace(config, group) {
-        Some(id) => id,
+    let target = match select_workspace(config, group) {
+        Some(t) => t,
         None => return PlacementAction::Skip { reason: SkipReason::NoMatchingGroup },
     };
 
     PlacementAction::Place {
-        workspace: workspace_id,
+        workspace: target,
         then: PostPlaceActions {
             switch_to: config.switch_to_workspace,
             maximize: config.maximize,
@@ -193,7 +206,7 @@ fn select_group<'a>(
 }
 
 /// Select a workspace within a group per WorkspaceMode.
-fn select_workspace(config: &Config, group: &WorkspaceGroupStub) -> Option<WorkspaceId> {
+fn select_workspace(config: &Config, group: &WorkspaceGroupStub) -> Option<WorkspaceTarget> {
     match config.workspace_mode {
         WorkspaceMode::Same => unreachable!("Same mode is handled before group selection"),
         WorkspaceMode::NextFree => {
@@ -202,22 +215,22 @@ fn select_workspace(config: &Config, group: &WorkspaceGroupStub) -> Option<Works
                 .workspaces
                 .iter()
                 .find(|w| w.toplevel_ids.is_empty())
-                .map(|w| w.id)
+                .map(|w| WorkspaceTarget::Existing(w.id))
         }
         WorkspaceMode::NewEach => {
-            // FR-014: in pure-logic layer we model "create a new workspace" by returning
-            // a sentinel ID (u64::MAX) that the caller (Phase 3) interprets as a
-            // create_workspace request. If can_create_workspace is false, fall back to
-            // NextFree semantics.
+            // FR-014: WorkspaceTarget::Create signals the caller (Phase 3) to invoke
+            // create_workspace on the group manager. If can_create_workspace is false,
+            // fall back to NextFree semantics — the WARN-once is emitted by the caller,
+            // not by this pure function.
             if group.can_create_workspace {
-                Some(u64::MAX) // sentinel: "create new workspace"
+                Some(WorkspaceTarget::Create)
             } else {
                 // Degradation: fall back to next-free
                 group
                     .workspaces
                     .iter()
                     .find(|w| w.toplevel_ids.is_empty())
-                    .map(|w| w.id)
+                    .map(|w| WorkspaceTarget::Existing(w.id))
             }
         }
     }
@@ -384,7 +397,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 200,
+                workspace: WorkspaceTarget::Existing(200),
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
         );
@@ -408,7 +421,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 101,
+                workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
         );
@@ -434,14 +447,14 @@ mod tests {
     // --- FR-014: NewEach ---
 
     #[test]
-    fn decide_returns_sentinel_create_workspace_in_new_each_mode() {
+    fn decide_returns_create_target_in_new_each_mode() {
         let cfg = config_with_mode("new-each");
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
-        // Sentinel u64::MAX means "create a new workspace"
+        // WorkspaceTarget::Create instructs Phase 3 to invoke create_workspace.
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: u64::MAX,
+                workspace: WorkspaceTarget::Create,
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
         );
@@ -465,7 +478,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 101,
+                workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
         );
@@ -480,7 +493,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 101,
+                workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: true, maximize: false },
             }
         );
@@ -493,7 +506,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 101,
+                workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: true },
             }
         );
@@ -526,7 +539,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 200,
+                workspace: WorkspaceTarget::Existing(200),
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
         );
@@ -541,7 +554,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 101,
+                workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
         );
@@ -572,7 +585,7 @@ mod tests {
         assert_eq!(
             result,
             PlacementAction::Place {
-                workspace: 100,
+                workspace: WorkspaceTarget::Existing(100),
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
         );
