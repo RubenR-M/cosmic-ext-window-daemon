@@ -44,6 +44,14 @@ use crate::wayland::workspace::WorkspaceManager;
 /// unanswered).
 pub struct PendingPlacement {
     pub cosmic_toplevel: cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
+    /// ObjectId of the foreign toplevel handle this placement targets. Used by
+    /// ToplevelInfoHandler::toplevel_closed to evict pendings whose toplevel
+    /// closed during the window between push and the next done() scan — if we
+    /// failed to evict, scan_pending_placements would issue move_to_ext_workspace
+    /// against a zombie proxy (silent no-op at the wire layer) AND log
+    /// "deferred placement completed" — exactly the lying-in-the-journal
+    /// failure mode this project is built to prevent.
+    pub foreign_toplevel_id: wayland_client::backend::ObjectId,
     pub group_handle: wayland_protocols::ext::workspace::v1::client::ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
     pub output: wayland_client::protocol::wl_output::WlOutput,
     /// Snapshot of workspace handle ObjectIds in the group BEFORE create_workspace.
@@ -315,9 +323,11 @@ fn execute_place(
             };
 
             // Workspace name policy (Q1): app_id, fallback auto-N.
+            // wrapping_add is hygienic; u64 saturation is unreachable in practice
+            // (~5×10^11 years at 1 toplevel/μs) but defensive against UB-on-overflow.
             let ws_name = if info.app_id.is_empty() {
                 let name = format!("auto-{}", app.new_each_counter);
-                app.new_each_counter += 1;
+                app.new_each_counter = app.new_each_counter.wrapping_add(1);
                 name
             } else {
                 info.app_id.clone()
@@ -356,8 +366,12 @@ fn execute_place(
             // Push pending placement. scan_pending_placements() on the next
             // WorkspaceHandler::done() will land it on the new workspace if one
             // appears, or degrade to next-free with WARN-once if not.
+            //
+            // foreign_toplevel_id is captured so toplevel_closed can evict the
+            // pending if the toplevel dies in the push→done window (W1 fix).
             app.pending_placements.push(PendingPlacement {
                 cosmic_toplevel: cosmic_handle,
+                foreign_toplevel_id: info.foreign_toplevel.id(),
                 group_handle,
                 output,
                 workspace_ids_before,
@@ -606,6 +620,7 @@ pub fn scan_pending_placements(app: &mut crate::state::AppData) {
                         );
                     }
                 }
+                // Do NOT increment i — swap_remove brought a new pending into [i].
             }
         }
     }

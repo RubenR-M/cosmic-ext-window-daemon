@@ -82,13 +82,23 @@ impl ToplevelInfoHandler for AppData {
     ///
     /// FR-006: remove the ObjectId from the handled-set so a potential future
     /// toplevel that reuses the same protocol object slot starts fresh.
+    ///
+    /// W1: evict any FR-014 pending placement targeting this toplevel. Without
+    /// this, scan_pending_placements would later issue move_to_ext_workspace
+    /// against a zombie cosmic_toplevel proxy — a silent no-op at the wire
+    /// layer that nonetheless logs "deferred placement completed" (a lie in
+    /// the journal). Same silent-failure class as D9/D15/WorkspaceTarget; this
+    /// guard closes it.
     fn toplevel_closed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<AppData>,
         handle: &ExtForeignToplevelHandleV1,
     ) {
-        self.handled.remove(&handle.id());
+        let closed_id = handle.id();
+        self.handled.remove(&closed_id);
+        self.pending_placements
+            .retain(|p| p.foreign_toplevel_id != closed_id);
     }
 
     // info_done and finished use the default no-op impls from the trait.
