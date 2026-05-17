@@ -1,0 +1,36 @@
+[Unit]
+Description=COSMIC extension window daemon — automatic workspace placement
+Documentation=https://github.com/RubenR-M/cosmic-ext-window-daemon
+# Start after the graphical session target so that the Wayland compositor
+# is already running and the WAYLAND_DISPLAY / XDG_RUNTIME_DIR env vars
+# are present in the user session environment.
+After=graphical-session.target
+PartOf=graphical-session.target
+# FR-OOS-002: no daemonization — systemd manages the process lifecycle.
+# The daemon writes to stdout; journald captures it transparently.
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/cosmic-ext-window-daemon
+Restart=on-failure
+# Respect the backoff sequence defined in FR-021 (D11): 1s, 2s, 5s, 10s, 30s.
+# RestartSec controls the minimum delay between restarts when Restart=on-failure.
+# Keep it short here; the daemon's own reconnect supervisor handles graduated
+# backoff internally for compositor disconnects. A hard crash (exit != 0) is
+# retried by systemd after RestartSec.
+RestartSec=5s
+# Prevent a fast-fail startup loop from hammering the system.
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+# Allow the service to be restarted manually after hitting the start limit.
+StartLimitAction=none
+# Log goes to stdout → journald. Use `journalctl --user -u cosmic-ext-window-daemon`
+# to inspect.
+StandardOutput=journal
+StandardError=journal
+# Pass RUST_LOG through the session environment so users can control
+# log verbosity via their ~/.config/environment.d/ or session environment.
+PassEnvironment=RUST_LOG WAYLAND_DISPLAY XDG_RUNTIME_DIR
+
+[Install]
+WantedBy=graphical-session.target
