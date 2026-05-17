@@ -3,9 +3,11 @@
 //
 // Pure decision function; no Wayland I/O or side effects.
 // Stand-in types capture only the fields the policy needs.
-// Real types are wired in Phase 3 (T-017 area) via thin From conversions.
+// Real types are wired in Phase 3 (T-019) via thin From conversions.
 //
-// Implemented in T-006 (Phase 1).
+// T-006 (Phase 1): pure decide() + stubs.
+// Phase 3 / T-019 wiring lives in `crate::runtime` (NOT here) so this module
+// stays Wayland-free and the stub-based tests stay honest.
 
 #![allow(dead_code)]
 
