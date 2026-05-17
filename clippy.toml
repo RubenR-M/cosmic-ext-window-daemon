@@ -3,9 +3,11 @@
 # These disallowed-methods entries forbid direct calls to workspace-state-mutating
 # protocol methods outside of `wayland::workspace::WorkspaceManager::transaction`.
 #
-# The crate root (`src/main.rs`) carries `#![deny(clippy::disallowed_methods)]`
-# and `src/wayland/workspace.rs` carries `#[allow(clippy::disallowed_methods)]`
-# at module scope — those are the only two authorized call sites.
+# The crate root (`src/main.rs`) WILL carry `#![deny(clippy::disallowed_methods)]`
+# in PR 2 (T-010) — intentionally absent in this PR. `src/wayland/workspace.rs`
+# already carries `#![allow(clippy::disallowed_methods)]` at module scope; once
+# the deny activates in PR 2, that allow makes `wayland::workspace` the sole
+# authorized call site for the methods listed below.
 #
 # Paths verified against wayland-protocols-0.32.12 (resolved from wayland-protocols = "0.32"
 # with the `staging` feature), which is compatible with the 0.32.10 tarball examined in
