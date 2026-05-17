@@ -21,6 +21,7 @@ pub mod config;
 pub mod ids;
 pub mod placement;
 pub mod reconnect;
+pub mod runtime;
 pub mod state;
 pub mod verify;
 pub mod wayland;

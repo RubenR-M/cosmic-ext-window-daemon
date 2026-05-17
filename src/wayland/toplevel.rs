@@ -28,7 +28,7 @@ impl ToplevelInfoHandler for AppData {
     /// FR-023: no grace period — placement logic runs directly here, without
     /// sleeping or deferring to a timer.
     ///
-    /// FR-005: the handled-set check happens inside placement::handle_new_toplevel.
+    /// FR-005: the handled-set check happens inside runtime::handle_new_toplevel.
     fn new_toplevel(
         &mut self,
         _conn: &Connection,
@@ -51,8 +51,8 @@ impl ToplevelInfoHandler for AppData {
             }
         };
 
-        // Delegate to the placement coordinator (T-019).
-        if let Err(e) = crate::placement::handle_new_toplevel(self, &info) {
+        // Delegate to the runtime integration layer (T-019).
+        if let Err(e) = crate::runtime::handle_new_toplevel(self, &info) {
             tracing::warn!(error = %e, "placement error for new toplevel; skipping");
         }
 
@@ -74,7 +74,7 @@ impl ToplevelInfoHandler for AppData {
         _handle: &ExtForeignToplevelHandleV1,
     ) {
         // No-op in v0 — idempotency via handled-set. The handle is already in
-        // self.handled after new_toplevel, so placement::handle_new_toplevel
+        // self.handled after new_toplevel, so runtime::handle_new_toplevel
         // would return Skip(AlreadyHandled) anyway.
     }
 
