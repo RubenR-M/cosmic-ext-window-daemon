@@ -15,10 +15,19 @@
 //   impossible to express in the Rust type system within this module because:
 //   1. WorkspaceTx<'tx> has no public constructor — it can only be created by
 //      WorkspaceManager::transaction(), which owns the commit() call.
-//   2. WorkspaceTx<'tx> carries PhantomData<&'tx mut ()>, making 'tx invariant.
-//      Combined with the HRTB `for<'tx>` bound on the closure, the transaction
-//      handle cannot outlive the closure or be stored outside it.
-//   3. The only path that compiles for a caller is:
+//   2. WorkspaceTx<'tx> carries PhantomData<fn(&'tx ()) -> &'tx ()>, making 'tx
+//      genuinely invariant (a `fn` parameter is contravariant + a `fn` return is
+//      covariant — combined they pin the lifetime to exactly 'tx with no
+//      coercions in either direction). Combined with the `for<'tx>` HRTB on the
+//      closure, the transaction handle cannot outlive the closure or be stored
+//      outside it.
+//   3. The closure receives `&mut WorkspaceTx<'tx>`. `&mut T` is invariant in T,
+//      which independently prevents the handle from being smuggled out via the
+//      mutable reference. Both invariance mechanisms are load-bearing: if a
+//      future maintainer changes the closure to take `WorkspaceTx<'tx>` by-value,
+//      the &mut-invariance disappears and the PhantomData becomes the sole
+//      remaining guard.
+//   4. The only path that compiles for a caller is:
 //        manager.transaction(|tx| { tx.activate(handle); Ok(()) })
 //      which unconditionally calls commit() after the closure returns Ok(_).
 
@@ -93,8 +102,20 @@ impl<'a> WorkspaceManager<'a> {
     ///   `WorkspaceTx` outside the closure.
     /// - `WorkspaceTx` has no public constructor, so the only way to obtain one
     ///   is by entering this method.
-    /// - `PhantomData<&'tx mut ()>` makes `'tx` invariant, preventing lifetime
-    ///   coercions that could smuggle the handle out.
+    /// - `PhantomData<fn(&'tx ()) -> &'tx ()>` makes `'tx` genuinely invariant.
+    ///   `&mut T` is also invariant in `T` so the closure-arg shape adds a second
+    ///   independent guard; both are required for the future-by-value-closure case.
+    ///
+    /// # Re-entrancy
+    ///
+    /// `transaction` takes `&self` (not `&mut self`) so the borrow checker does
+    /// NOT prevent a nested `self.transaction(...)` call from inside the closure.
+    /// This is intentional: the COSMIC compositor's `ext_workspace_manager_v1::commit`
+    /// is idempotent on an empty batch, the COSMIC client event loop is
+    /// single-threaded (calloop), and forbidding nesting at the type system level
+    /// would block legitimate patterns (e.g., a helper that opens a transaction
+    /// to run a single activation). Nested transactions produce N consecutive
+    /// `commit()` calls; this is harmless at the protocol layer.
     pub fn transaction<R, F>(&self, f: F) -> Result<R, WorkspaceTxError>
     where
         F: for<'tx> FnOnce(&mut WorkspaceTx<'tx>) -> Result<R, WorkspaceTxError>,
@@ -127,11 +148,18 @@ impl<'a> WorkspaceManager<'a> {
 ///
 /// Invariants:
 /// - No public constructor: constructible only from `WorkspaceManager::transaction`.
-/// - `PhantomData<&'tx mut ()>`: `'tx` is invariant, preventing escape.
+/// - `PhantomData<fn(&'tx ()) -> &'tx ()>`: `'tx` is genuinely invariant.
+///   A `fn` argument position is contravariant; a `fn` return position is
+///   covariant; combined on the SAME lifetime they force the lifetime to be
+///   exactly `'tx` with no widening or shrinking. This is the canonical
+///   invariant-lifetime marker (see the rustonomicon "Subtyping and Variance").
+///   `PhantomData<&'tx mut ()>` would be WRONG here: that form is covariant in
+///   `'tx` because the invariance of `&mut T` applies to `T` (which is `()` —
+///   lifetime-less), not to the reference's own lifetime.
 pub struct WorkspaceTx<'tx> {
     manager: &'tx ExtWorkspaceManagerV1,
-    // Invariant in 'tx — the transaction handle cannot outlive the closure scope.
-    _marker: PhantomData<&'tx mut ()>,
+    // Invariant in 'tx — the transaction handle's lifetime cannot widen or shrink.
+    _marker: PhantomData<fn(&'tx ()) -> &'tx ()>,
 }
 
 impl<'tx> WorkspaceTx<'tx> {
