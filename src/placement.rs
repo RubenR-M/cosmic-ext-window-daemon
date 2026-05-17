@@ -12,12 +12,14 @@
 use std::collections::HashSet;
 
 use crate::config::{Config, WorkspaceMode};
+use crate::ids::WorkspaceId;
 
 // ---------------------------------------------------------------------------
 // Public stand-in types (replaces real Wayland types for pure-logic tests)
 // ---------------------------------------------------------------------------
 
-pub type WorkspaceId = u64;
+// WorkspaceId is hoisted to `crate::ids` so Phase 3 can swap its underlying
+// representation in one place. See src/ids.rs.
 
 /// Minimal snapshot of a toplevel window — fields the policy uses.
 #[derive(Debug, Clone)]

@@ -18,11 +18,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::ids::WorkspaceId;
+
 // ---------------------------------------------------------------------------
 // Type aliases (pure-logic; Phase 3 wires to real wayland_client::backend::ObjectId)
 // ---------------------------------------------------------------------------
 
-pub type WorkspaceId = u64;
+// WorkspaceId is hoisted to `crate::ids` so Phase 3 can swap its underlying
+// representation in one place. TimerId stays local because it is a
+// calloop-specific concept introduced in Phase 3 wiring.
 pub type TimerId = u64;
 
 // ---------------------------------------------------------------------------
