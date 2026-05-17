@@ -97,11 +97,53 @@ pub enum SkipReason {
     WorkspaceModeSame,
 }
 
+/// Observable warnings emitted by the policy engine.
+///
+/// Phase 3 MUST read these from the `PlacementDecision.warns` field and emit
+/// the corresponding WARN-once-per-process log lines. The warnings are
+/// observable from the return value (not buried in `tracing!` macros) so
+/// tests can assert their presence without mocking the logging stack.
+///
+/// Same discipline as `VerifyEvent` in `crate::verify` and `WorkspaceTarget`
+/// in this module: side effects that callers MUST honor live in the return
+/// value, not in hidden state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementWarn {
+    /// FR-012: `WORKSPACE_OUTPUT` was set but the named output is not present
+    /// in any workspace group. The decision falls back to per-toplevel output
+    /// selection (FR-011). Phase 3 emits WARN-once-per-process:
+    ///     "`WORKSPACE_OUTPUT` name not found; falling back to per-toplevel output"
+    WorkspaceOutputFallback,
+
+    /// FR-014: `WORKSPACE_MODE=new-each` but the selected group does NOT
+    /// advertise the `create_workspace` capability. The decision falls back
+    /// to `next-free` semantics within the group. Phase 3 emits
+    /// WARN-once-per-process:
+    ///     "`new-each` not supported on this compositor; degraded to `next-free`"
+    NewEachUnsupported,
+}
+
+/// The full result of `decide`: the action to take plus any observable
+/// warnings the caller must emit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementDecision {
+    pub action: PlacementAction,
+    pub warns: Vec<PlacementWarn>,
+}
+
+impl PlacementDecision {
+    /// Construct a decision with no warnings (the common case).
+    fn just(action: PlacementAction) -> Self {
+        Self { action, warns: Vec::new() }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Pure decision function: given config and world state, return a placement action.
+/// Pure decision function: given config and world state, return a placement
+/// decision (action + any observable warnings).
 ///
 /// `handled` is the daemon's in-memory set of toplevel IDs already processed (FR-005).
 pub fn decide(
@@ -110,58 +152,87 @@ pub fn decide(
     workspaces: &WorkspaceStateStub,
     handled: &HashSet<u64>,
     toplevel_id: u64,
-) -> PlacementAction {
+) -> PlacementDecision {
+    // Early-exit branches: never accumulate warnings (the WARN-relevant work
+    // happens during group/workspace selection, downstream of these guards).
+
     // FR-005 — idempotency
     if handled.contains(&toplevel_id) {
-        return PlacementAction::Skip { reason: SkipReason::AlreadyHandled };
+        return PlacementDecision::just(PlacementAction::Skip { reason: SkipReason::AlreadyHandled });
     }
 
     // FR-007 — exclusion by app_id
     if config.excluded_app_ids.iter().any(|id| id == &info.app_id) {
-        return PlacementAction::Skip { reason: SkipReason::ExcludedByAppId };
+        return PlacementDecision::just(PlacementAction::Skip { reason: SkipReason::ExcludedByAppId });
     }
 
     // FR-008 — exclusion by title regex
     if let Some(re) = &config.excluded_title_regex {
         if re.is_match(&info.title) {
-            return PlacementAction::Skip { reason: SkipReason::ExcludedByTitle };
+            return PlacementDecision::just(PlacementAction::Skip { reason: SkipReason::ExcludedByTitle });
         }
     }
 
     // FR-009 — cosmic_toplevel=None guard
     if !info.cosmic_toplevel_present {
-        return PlacementAction::Skip { reason: SkipReason::NoCosmicToplevel };
+        return PlacementDecision::just(PlacementAction::Skip { reason: SkipReason::NoCosmicToplevel });
     }
 
     // FR-010 — empty outputs guard
     if info.output_ids.is_empty() {
-        return PlacementAction::Skip { reason: SkipReason::NoOutputs };
+        return PlacementDecision::just(PlacementAction::Skip { reason: SkipReason::NoOutputs });
     }
 
     // FR-015 — WORKSPACE_MODE=same: no move
     if config.workspace_mode == WorkspaceMode::Same {
-        return PlacementAction::Skip { reason: SkipReason::WorkspaceModeSame };
+        return PlacementDecision::just(PlacementAction::Skip { reason: SkipReason::WorkspaceModeSame });
     }
 
+    // Group + workspace selection both may emit warnings. We accumulate them
+    // even on Skip paths so the caller can still emit the WARN that explains
+    // why the skip happened in the multi-warn scenario (e.g., WORKSPACE_OUTPUT
+    // absent AND per-toplevel fallback also fails → user gets BOTH signals).
+    let mut warns: Vec<PlacementWarn> = Vec::new();
+
     // FR-011 / FR-012 — select target group
-    let target_group = select_group(config, info, workspaces);
+    let (target_group, group_warn) = select_group(config, info, workspaces);
+    if let Some(w) = group_warn {
+        warns.push(w);
+    }
     let group = match target_group {
         Some(g) => g,
-        None => return PlacementAction::Skip { reason: SkipReason::NoMatchingGroup },
+        None => {
+            return PlacementDecision {
+                action: PlacementAction::Skip { reason: SkipReason::NoMatchingGroup },
+                warns,
+            };
+        }
     };
 
     // FR-013 / FR-014 — select target workspace within group
-    let target = match select_workspace(config, group) {
+    let (target, workspace_warn) = select_workspace(config, group);
+    if let Some(w) = workspace_warn {
+        warns.push(w);
+    }
+    let target = match target {
         Some(t) => t,
-        None => return PlacementAction::Skip { reason: SkipReason::NoMatchingGroup },
+        None => {
+            return PlacementDecision {
+                action: PlacementAction::Skip { reason: SkipReason::NoMatchingGroup },
+                warns,
+            };
+        }
     };
 
-    PlacementAction::Place {
-        workspace: target,
-        then: PostPlaceActions {
-            switch_to: config.switch_to_workspace,
-            maximize: config.maximize,
+    PlacementDecision {
+        action: PlacementAction::Place {
+            workspace: target,
+            then: PostPlaceActions {
+                switch_to: config.switch_to_workspace,
+                maximize: config.maximize,
+            },
         },
+        warns,
     }
 }
 
@@ -170,11 +241,19 @@ pub fn decide(
 // ---------------------------------------------------------------------------
 
 /// Select the workspace group based on config (WORKSPACE_OUTPUT override or per-toplevel).
+///
+/// Returns `(group, warn)`. The warn is `Some(WorkspaceOutputFallback)` iff
+/// `WORKSPACE_OUTPUT` was set but the named output was not found in any group
+/// (regardless of whether per-toplevel fallback subsequently matched). The
+/// warning is observable from the caller and MUST be propagated by Phase 3
+/// — it is not optional decoration.
 fn select_group<'a>(
     config: &Config,
     info: &ToplevelInfoStub,
     workspaces: &'a WorkspaceStateStub,
-) -> Option<&'a WorkspaceGroupStub> {
+) -> (Option<&'a WorkspaceGroupStub>, Option<PlacementWarn>) {
+    let mut warn: Option<PlacementWarn> = None;
+
     if let Some(ref output_name) = config.workspace_output {
         // FR-012: WORKSPACE_OUTPUT override. In pure-logic layer we compare by name stored
         // as a string. The stub doesn't carry output names, so we model the override
@@ -188,10 +267,15 @@ fn select_group<'a>(
                 .iter()
                 .find(|g| g.output_ids.contains(&override_output_id));
             if found.is_some() {
-                return found;
+                return (found, None);
             }
-            // Fall through to per-toplevel selection (the caller will WARN-once; that
-            // is state kept in AppData.one_shot, not in this pure function).
+            // Override-output absent: emit WorkspaceOutputFallback and fall through to
+            // per-toplevel selection. The warning fires whether or not per-toplevel matches.
+            warn = Some(PlacementWarn::WorkspaceOutputFallback);
+        } else {
+            // Non-numeric WORKSPACE_OUTPUT (legacy/edge case at the stub layer).
+            // The named-output lookup would have failed in Phase 3 too, so still warn.
+            warn = Some(PlacementWarn::WorkspaceOutputFallback);
         }
     }
 
@@ -204,35 +288,45 @@ fn select_group<'a>(
         .collect();
 
     candidates.sort_by_key(|g| g.id);
-    candidates.into_iter().next()
+    (candidates.into_iter().next(), warn)
 }
 
 /// Select a workspace within a group per WorkspaceMode.
-fn select_workspace(config: &Config, group: &WorkspaceGroupStub) -> Option<WorkspaceTarget> {
+///
+/// Returns `(target, warn)`. The warn is `Some(NewEachUnsupported)` iff
+/// `WORKSPACE_MODE=new-each` was requested but the group does not advertise
+/// the `create_workspace` capability bit. The warning is observable from the
+/// caller and MUST be propagated by Phase 3 — silent degradation to
+/// next-free without the WARN would mask a configuration that needs
+/// administrator attention.
+fn select_workspace(
+    config: &Config,
+    group: &WorkspaceGroupStub,
+) -> (Option<WorkspaceTarget>, Option<PlacementWarn>) {
     match config.workspace_mode {
         WorkspaceMode::Same => unreachable!("Same mode is handled before group selection"),
         WorkspaceMode::NextFree => {
             // FR-013: first workspace with no toplevels
-            group
+            let target = group
                 .workspaces
                 .iter()
                 .find(|w| w.toplevel_ids.is_empty())
-                .map(|w| WorkspaceTarget::Existing(w.id))
+                .map(|w| WorkspaceTarget::Existing(w.id));
+            (target, None)
         }
         WorkspaceMode::NewEach => {
             // FR-014: WorkspaceTarget::Create signals the caller (Phase 3) to invoke
-            // create_workspace on the group manager. If can_create_workspace is false,
-            // fall back to NextFree semantics — the WARN-once is emitted by the caller,
-            // not by this pure function.
+            // create_workspace on the group manager.
             if group.can_create_workspace {
-                Some(WorkspaceTarget::Create)
+                (Some(WorkspaceTarget::Create), None)
             } else {
-                // Degradation: fall back to next-free
-                group
+                // Degradation: fall back to next-free + emit NewEachUnsupported warn.
+                let target = group
                     .workspaces
                     .iter()
                     .find(|w| w.toplevel_ids.is_empty())
-                    .map(|w| WorkspaceTarget::Existing(w.id))
+                    .map(|w| WorkspaceTarget::Existing(w.id));
+                (target, Some(PlacementWarn::NewEachUnsupported))
             }
         }
     }
@@ -298,7 +392,7 @@ mod tests {
         let mut handled = HashSet::new();
         handled.insert(99u64);
         let result = decide(&default_config(), &valid_info(), &simple_workspaces(), &handled, 99);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::AlreadyHandled });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::AlreadyHandled });
     }
 
     // --- FR-007: ExcludedByAppId ---
@@ -307,14 +401,14 @@ mod tests {
     fn decide_returns_skip_excluded_when_app_id_matches() {
         let cfg = config_with(&[("EXCLUDED_APP_IDS", "org.example.App,foot")]);
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::ExcludedByAppId });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::ExcludedByAppId });
     }
 
     #[test]
     fn decide_does_not_exclude_when_app_id_does_not_match() {
         let cfg = config_with(&[("EXCLUDED_APP_IDS", "foot")]);
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
-        assert!(matches!(result, PlacementAction::Place { .. }));
+        assert!(matches!(result.action, PlacementAction::Place { .. }));
     }
 
     #[test]
@@ -322,7 +416,7 @@ mod tests {
         // "Org.Example.App" should NOT match "org.example.App"
         let cfg = config_with(&[("EXCLUDED_APP_IDS", "Org.Example.App")]);
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
-        assert!(matches!(result, PlacementAction::Place { .. }));
+        assert!(matches!(result.action, PlacementAction::Place { .. }));
     }
 
     // --- FR-008: ExcludedByTitle ---
@@ -333,14 +427,14 @@ mod tests {
         let mut info = valid_info();
         info.title = "Picture-in-Picture — YouTube".to_string();
         let result = decide(&cfg, &info, &simple_workspaces(), &no_handled(), 1);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::ExcludedByTitle });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::ExcludedByTitle });
     }
 
     #[test]
     fn decide_does_not_exclude_when_title_does_not_match_regex() {
         let cfg = config_with(&[("EXCLUDED_TITLE_REGEX", "^Picture-in-Picture")]);
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
-        assert!(matches!(result, PlacementAction::Place { .. }));
+        assert!(matches!(result.action, PlacementAction::Place { .. }));
     }
 
     // --- FR-009: NoCosmicToplevel ---
@@ -350,7 +444,7 @@ mod tests {
         let mut info = valid_info();
         info.cosmic_toplevel_present = false;
         let result = decide(&default_config(), &info, &simple_workspaces(), &no_handled(), 1);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::NoCosmicToplevel });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::NoCosmicToplevel });
     }
 
     // --- FR-010: NoOutputs ---
@@ -360,7 +454,7 @@ mod tests {
         let mut info = valid_info();
         info.output_ids = vec![];
         let result = decide(&default_config(), &info, &simple_workspaces(), &no_handled(), 1);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::NoOutputs });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::NoOutputs });
     }
 
     // --- FR-015: WorkspaceModeSame ---
@@ -369,7 +463,7 @@ mod tests {
     fn decide_returns_skip_workspace_mode_same_when_mode_is_same() {
         let cfg = config_with_mode("same");
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::WorkspaceModeSame });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::WorkspaceModeSame });
     }
 
     // --- FR-011: per-toplevel group selection ---
@@ -397,7 +491,7 @@ mod tests {
         info.output_ids = vec![2];
         let result = decide(&default_config(), &info, &workspaces, &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(200),
                 then: PostPlaceActions { switch_to: false, maximize: false },
@@ -411,7 +505,7 @@ mod tests {
         let mut info = valid_info();
         info.output_ids = vec![99];
         let result = decide(&default_config(), &info, &simple_workspaces(), &no_handled(), 1);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::NoMatchingGroup });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::NoMatchingGroup });
     }
 
     // --- FR-013: NextFree ---
@@ -421,7 +515,7 @@ mod tests {
         // simple_workspaces: workspace 100 is occupied, 101 is empty → should pick 101.
         let result = decide(&default_config(), &valid_info(), &simple_workspaces(), &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: false },
@@ -443,7 +537,7 @@ mod tests {
             }],
         };
         let result = decide(&default_config(), &valid_info(), &workspaces, &no_handled(), 1);
-        assert_eq!(result, PlacementAction::Skip { reason: SkipReason::NoMatchingGroup });
+        assert_eq!(result.action, PlacementAction::Skip { reason: SkipReason::NoMatchingGroup });
     }
 
     // --- FR-014: NewEach ---
@@ -454,7 +548,7 @@ mod tests {
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
         // WorkspaceTarget::Create instructs Phase 3 to invoke create_workspace.
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Create,
                 then: PostPlaceActions { switch_to: false, maximize: false },
@@ -478,7 +572,7 @@ mod tests {
         };
         let result = decide(&cfg, &valid_info(), &workspaces, &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: false },
@@ -493,7 +587,7 @@ mod tests {
         let cfg = config_with(&[("SWITCH_TO_WORKSPACE", "1")]);
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: true, maximize: false },
@@ -506,7 +600,7 @@ mod tests {
         let cfg = config_with(&[("MAXIMIZE", "1")]);
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: true },
@@ -539,7 +633,7 @@ mod tests {
         let cfg = config_with(&[("WORKSPACE_OUTPUT", "2")]);
         let result = decide(&cfg, &valid_info(), &workspaces, &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(200),
                 then: PostPlaceActions { switch_to: false, maximize: false },
@@ -554,7 +648,7 @@ mod tests {
         let cfg = config_with(&[("WORKSPACE_OUTPUT", "99")]);
         let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(101),
                 then: PostPlaceActions { switch_to: false, maximize: false },
@@ -585,11 +679,130 @@ mod tests {
         };
         let result = decide(&default_config(), &valid_info(), &workspaces, &no_handled(), 1);
         assert_eq!(
-            result,
+            result.action,
             PlacementAction::Place {
                 workspace: WorkspaceTarget::Existing(100),
                 then: PostPlaceActions { switch_to: false, maximize: false },
             }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // W1 — Observable warns in PlacementDecision (FR-012, FR-014)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decide_emits_workspace_output_fallback_warn_when_override_output_absent_and_per_toplevel_matches() {
+        // WORKSPACE_OUTPUT=99 (absent), per-toplevel fallback to output 1 (group 10).
+        // Phase 3 must emit WARN-once-per-process; the warn appears on the decision.
+        let mut cfg = default_config();
+        cfg.workspace_output = Some("99".to_string());
+
+        let result = decide(&cfg, &valid_info(), &simple_workspaces(), &no_handled(), 1);
+
+        assert_eq!(
+            result.action,
+            PlacementAction::Place {
+                workspace: WorkspaceTarget::Existing(101),
+                then: PostPlaceActions { switch_to: false, maximize: false },
+            },
+            "per-toplevel fallback should still place on the correct workspace",
+        );
+        assert_eq!(
+            result.warns,
+            vec![PlacementWarn::WorkspaceOutputFallback],
+            "absent WORKSPACE_OUTPUT must emit WorkspaceOutputFallback warn",
+        );
+    }
+
+    #[test]
+    fn decide_emits_workspace_output_fallback_warn_even_when_per_toplevel_also_fails() {
+        // WORKSPACE_OUTPUT=99 (absent), toplevel on output 99 (no group has it).
+        // Result is Skip(NoMatchingGroup) BUT warn must still propagate so the user
+        // gets the "WORKSPACE_OUTPUT not found" signal alongside the skip log.
+        let mut cfg = default_config();
+        cfg.workspace_output = Some("99".to_string());
+        let mut info = valid_info();
+        info.output_ids = vec![99]; // no group has output 99
+
+        let result = decide(&cfg, &info, &simple_workspaces(), &no_handled(), 1);
+
+        assert_eq!(
+            result.action,
+            PlacementAction::Skip { reason: SkipReason::NoMatchingGroup },
+        );
+        assert_eq!(
+            result.warns,
+            vec![PlacementWarn::WorkspaceOutputFallback],
+            "warn must propagate even on Skip — both signals are independent",
+        );
+    }
+
+    #[test]
+    fn decide_emits_new_each_unsupported_warn_when_capability_bit_unset() {
+        // WORKSPACE_MODE=new-each, group does NOT advertise create_workspace capability.
+        // Decision degrades to next-free (WorkspaceTarget::Existing) and emits the warn.
+        let mut cfg = config_with_mode("new-each");
+        cfg.workspace_output = None;
+
+        let workspaces = WorkspaceStateStub {
+            groups: vec![WorkspaceGroupStub {
+                id: 10,
+                output_ids: vec![1],
+                can_create_workspace: false, // capability bit unset
+                workspaces: vec![WorkspaceStub { id: 101, toplevel_ids: vec![] }],
+            }],
+        };
+
+        let result = decide(&cfg, &valid_info(), &workspaces, &no_handled(), 1);
+
+        assert_eq!(
+            result.action,
+            PlacementAction::Place {
+                workspace: WorkspaceTarget::Existing(101),
+                then: PostPlaceActions { switch_to: false, maximize: false },
+            },
+            "degradation must produce a real Existing target, not Create",
+        );
+        assert_eq!(
+            result.warns,
+            vec![PlacementWarn::NewEachUnsupported],
+            "missing create_workspace capability must emit NewEachUnsupported warn",
+        );
+    }
+
+    #[test]
+    fn decide_emits_both_warns_when_output_absent_and_new_each_unsupported() {
+        // WORKSPACE_OUTPUT absent + WORKSPACE_MODE=new-each + capability unset.
+        // BOTH warns must appear on the decision in deterministic order.
+        let mut cfg = config_with_mode("new-each");
+        cfg.workspace_output = Some("99".to_string());
+
+        let workspaces = WorkspaceStateStub {
+            groups: vec![WorkspaceGroupStub {
+                id: 10,
+                output_ids: vec![1],
+                can_create_workspace: false,
+                workspaces: vec![WorkspaceStub { id: 101, toplevel_ids: vec![] }],
+            }],
+        };
+
+        let result = decide(&cfg, &valid_info(), &workspaces, &no_handled(), 1);
+
+        assert_eq!(
+            result.action,
+            PlacementAction::Place {
+                workspace: WorkspaceTarget::Existing(101),
+                then: PostPlaceActions { switch_to: false, maximize: false },
+            },
+        );
+        assert_eq!(
+            result.warns,
+            vec![
+                PlacementWarn::WorkspaceOutputFallback,
+                PlacementWarn::NewEachUnsupported,
+            ],
+            "warns appear in selection-pipeline order: group-selection first, then workspace-selection",
         );
     }
 }
