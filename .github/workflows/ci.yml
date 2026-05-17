@@ -48,6 +48,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        # `smithay-client-toolkit` (transitive dep via cosmic-client-toolkit)
+        # links against `libxkbcommon`; `wayland-client` may pull in `libwayland-client`.
+        # These are present on most Linux desktops by default; the GitHub Actions
+        # `ubuntu-latest` image is headless and needs them installed explicitly.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libwayland-dev \
+            pkg-config
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
