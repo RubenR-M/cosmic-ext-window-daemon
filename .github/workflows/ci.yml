@@ -86,6 +86,11 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Verify systemd unit file (A21 — catches section-placement regressions)
+        # systemd-analyze is part of the systemd package, present on ubuntu-latest
+        # without any extra apt-get install. No extra install needed.
+        run: systemd-analyze verify contrib/cosmic-ext-window-daemon.service
+
       - name: Clippy (D15 Layer 2 gate — blocks merge on disallowed_methods violations)
         run: cargo clippy --all-targets -- -D warnings
         # This step enforces the D15 invariant codebase-wide:

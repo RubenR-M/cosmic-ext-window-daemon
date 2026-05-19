@@ -15,7 +15,7 @@ SYSTEMD_DIR ?= $(HOME)/.config/systemd/user
 SERVICE     := cosmic-ext-window-daemon.service
 BINARY      := cosmic-ext-window-daemon
 
-.PHONY: build install uninstall enable disable
+.PHONY: build install uninstall enable disable verify-unit
 
 build:
 	$(CARGO) build --release
@@ -42,3 +42,9 @@ enable:
 disable:
 	systemctl --user stop $(SERVICE)
 	systemctl --user disable $(SERVICE)
+
+# Lint the systemd unit file. Run locally or in CI.
+# systemd-analyze is part of systemd itself — no extra package needed on
+# Arch/Fedora/Debian-based distros. GitHub Actions ubuntu-latest includes it.
+verify-unit:
+	systemd-analyze verify contrib/$(SERVICE)
