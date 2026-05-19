@@ -9,15 +9,26 @@
 // The actual sleep is performed by Supervisor::run() between retries.
 //
 // Supervisor::run() is the outer reconnect loop. Each iteration calls
-// connect_and_run() (defined in main.rs / the binary) which owns one
-// Connection, one EventLoop<'static, AppData>, and one AppData. On
-// RunError::BackendDisconnect, Supervisor advances the BackoffState, sleeps,
-// and retries. On ExitReason::Signal, Supervisor::run() returns Ok(()).
+// connect_and_run() (defined in app.rs) which owns one Connection, one
+// EventLoop<'static, AppData>, and one AppData. On RunError::BackendDisconnect,
+// Supervisor advances the BackoffState, sleeps, and retries.
+//
+// Signal safety during backoff:
+//   calloop's Signals source blocks SIGTERM/SIGINT on the event-loop thread and
+//   delivers them via signalfd. When the EventLoop drops (on BackendDisconnect),
+//   the Signals source drops and unblocks the signals at the thread level.
+//   The process is then vulnerable to default signal disposition (SIGTERM kills)
+//   while sleeping in the backoff window. To prevent this, Supervisor::run()
+//   installs a process-level SIGTERM/SIGINT handler BEFORE the first iteration.
+//   The handler sets an Arc<AtomicBool> shutdown flag; run_with_sleep polls it
+//   at 50ms intervals during backoff sleep. If the flag is set, the loop returns
+//   Ok(()) immediately. The calloop Signals source (happy path) also remains —
+//   whichever fires first wins.
 //
 // Implemented in T-008 (Phase 1) for BackoffState; T-020 (Phase 4) for Supervisor.
 
-#![allow(dead_code)]
-
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -31,6 +42,34 @@ const BACKOFF_STEPS: &[Duration] = &[
     Duration::from_secs(10),
     Duration::from_secs(30),
 ];
+
+/// Poll interval during backoff sleep — how often we check the shutdown flag.
+/// Must be short enough that SIGTERM is acted upon within 100ms.
+const SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+// ---------------------------------------------------------------------------
+// Process-level shutdown flag
+//
+// This static is set by the extern "C" signal handler and read by
+// run_with_sleep during backoff polling. Using OnceLock<Arc<AtomicBool>>
+// allows the flag to be shared with run_with_sleep while keeping the
+// extern "C" handler dependency-free.
+// ---------------------------------------------------------------------------
+
+static PROCESS_SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// SIGTERM / SIGINT handler (process-level safety net).
+///
+/// # Safety
+/// This function is an async-signal-safe handler: it performs only an atomic
+/// store, which is permitted inside a signal handler on Linux.
+/// Installed via nix::sys::signal::sigaction before the supervisor loop starts.
+extern "C" fn handle_process_shutdown(_sig: std::os::raw::c_int) {
+    // SAFETY: atomic store is async-signal-safe.
+    if let Some(flag) = PROCESS_SHUTDOWN_FLAG.get() {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -152,21 +191,66 @@ where
         }
     }
 
-    /// Run the outer loop using `thread::sleep` for backoff delays.
+    /// Run the outer loop with process-level SIGTERM/SIGINT handling.
+    ///
+    /// Installs a process-level signal handler that sets a shutdown flag before
+    /// the first iteration. This ensures SIGTERM during a backoff sleep terminates
+    /// the daemon within 50ms (the poll interval) rather than relying on
+    /// calloop's Signals source, which is only active inside the event loop.
     ///
     /// - On `Ok(ExitReason::Signal)`: return `Ok(())`.
     /// - On `Err(RunError::BackendDisconnect)`: log INFO, advance backoff, sleep, retry.
-    /// - On `Err(RunError::StartupFailure(e))`: propagate immediately.
+    /// - On `Err(RunError::StartupFailure(e))` or `Err(RunError::InternalError(e))`:
+    ///   propagate immediately without retry.
     pub fn run(&mut self) -> anyhow::Result<()> {
-        self.run_with_sleep(std::thread::sleep)
+        // Initialize the process shutdown flag (idempotent across reconnects).
+        let flag = PROCESS_SHUTDOWN_FLAG
+            .get_or_init(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+
+        // Install process-level SIGTERM/SIGINT handlers.
+        // SAFETY: we install a simple async-signal-safe handler (atomic store).
+        // These coexist with calloop's Signals source: when the event loop is
+        // running, calloop delivers signals via signalfd (happy path). When the
+        // event loop has exited (backoff window), these handlers fire instead.
+        unsafe {
+            use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal};
+            let sa = SigAction::new(
+                SigHandler::Handler(handle_process_shutdown),
+                SaFlags::SA_RESTART,
+                SigSet::empty(),
+            );
+            // Ignore error: if sigaction fails we degrade gracefully (no handler).
+            let _ = nix::sys::signal::sigaction(Signal::SIGTERM, &sa);
+            let _ = nix::sys::signal::sigaction(Signal::SIGINT, &sa);
+        }
+
+        self.run_with_sleep(flag, std::thread::sleep)
     }
 
-    /// Run the outer loop with an injectable sleep function.
+    /// Run the outer loop with an injectable sleep function and shutdown flag.
     ///
-    /// Production callers use `run()` (which injects `std::thread::sleep`).
-    /// Tests inject a no-op closure to avoid real sleeps.
-    pub fn run_with_sleep(&mut self, mut sleep_fn: impl FnMut(Duration)) -> anyhow::Result<()> {
+    /// - `shutdown_flag`: polled at `SLEEP_POLL_INTERVAL` during backoff sleep.
+    ///   When set, the loop exits with `Ok(())` (treated as Signal).
+    ///   Production callers use `run()` which supplies the process signal handler flag.
+    ///   Tests inject their own `Arc<AtomicBool>` to control shutdown without signals.
+    /// - `sleep_fn(Duration)`: called with sub-intervals up to `SLEEP_POLL_INTERVAL`.
+    ///   Tests inject a no-op to avoid real sleeps; in production this is
+    ///   `std::thread::sleep`.
+    pub(crate) fn run_with_sleep(
+        &mut self,
+        shutdown_flag: Arc<AtomicBool>,
+        mut sleep_fn: impl FnMut(Duration),
+    ) -> anyhow::Result<()> {
         loop {
+            // Check the shutdown flag before each connect attempt so that a
+            // signal received between the last sleep and the next connect
+            // attempt is handled promptly.
+            if shutdown_flag.load(Ordering::Relaxed) {
+                tracing::info!("shutdown flag set before connect attempt; exiting");
+                return Ok(());
+            }
+
             match (self.connect_fn)(&self.config, &mut self.backoff) {
                 Ok(ExitReason::Signal) => {
                     tracing::info!("received shutdown signal; exiting");
@@ -178,7 +262,18 @@ where
                         delay_secs = delay.as_secs_f64(),
                         "Wayland compositor disconnected; reconnecting after backoff"
                     );
-                    sleep_fn(delay);
+                    // Poll shutdown_flag at SLEEP_POLL_INTERVAL during the full delay.
+                    // Guarantees we respond to SIGTERM within SLEEP_POLL_INTERVAL (50ms).
+                    let mut remaining = delay;
+                    while remaining > Duration::ZERO {
+                        if shutdown_flag.load(Ordering::Relaxed) {
+                            tracing::info!("shutdown flag set during backoff sleep; exiting");
+                            return Ok(());
+                        }
+                        let step = remaining.min(SLEEP_POLL_INTERVAL);
+                        sleep_fn(step);
+                        remaining = remaining.saturating_sub(step);
+                    }
                     // Continue loop — backoff.reset() is called inside connect_fn
                     // on successful connect+roundtrip (design §6.5).
                 }
@@ -269,11 +364,8 @@ mod tests {
     //
     // These tests use a stub connect_fn instead of a real Wayland compositor
     // so they run in CI without FR-OOS-008 preconditions (no live compositor).
-    // The sleep inside Supervisor::run() is bypassed by using zero-duration
-    // steps in the tests via a modified approach: we mock the connect_fn
-    // to control retry sequences, and we do NOT override BackoffState since
-    // the actual sleep is at run() level. Instead tests inject immediate-return
-    // connect functions and verify the correct call pattern.
+    // Tests inject their own Arc<AtomicBool> shutdown flag so that no process
+    // signal handler is involved — the flag is the only control mechanism.
     // -----------------------------------------------------------------------
 
     use std::sync::{Arc, Mutex};
@@ -291,9 +383,13 @@ mod tests {
         }
     }
 
+    fn no_shutdown() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn supervisor_exits_cleanly_on_signal() {
-        // connect_fn immediately returns Signal — Supervisor::run() must return Ok(()).
+        // connect_fn immediately returns Signal — Supervisor must return Ok(()).
         let call_count = Arc::new(Mutex::new(0u32));
         let call_count_clone = call_count.clone();
 
@@ -303,7 +399,7 @@ mod tests {
             Ok(ExitReason::Signal)
         });
 
-        let result = supervisor.run_with_sleep(|_| {});
+        let result = supervisor.run_with_sleep(no_shutdown(), |_| {});
         assert!(result.is_ok(), "expected Ok on clean signal, got {:?}", result);
         assert_eq!(*call_count.lock().unwrap(), 1, "connect_fn must be called exactly once");
     }
@@ -312,7 +408,6 @@ mod tests {
     fn supervisor_retries_on_backend_disconnect_then_exits_on_signal() {
         // connect_fn: fail twice with BackendDisconnect, then return Signal.
         // Supervisor must retry (call count = 3) and return Ok(()).
-        // Uses run_with_sleep(|_| {}) to avoid real sleeps.
         let call_count = Arc::new(Mutex::new(0u32));
         let call_count_clone = call_count.clone();
 
@@ -331,7 +426,7 @@ mod tests {
             }
         });
 
-        let result = supervisor.run_with_sleep(|_| {});
+        let result = supervisor.run_with_sleep(no_shutdown(), |_| {});
         assert!(result.is_ok(), "expected Ok after reconnect, got {:?}", result);
         assert_eq!(*call_count.lock().unwrap(), 3, "connect_fn must be called 3 times");
     }
@@ -348,8 +443,105 @@ mod tests {
             Err(RunError::StartupFailure(anyhow::anyhow!("missing cosmic extension")))
         });
 
-        let result = supervisor.run_with_sleep(|_| {});
+        let result = supervisor.run_with_sleep(no_shutdown(), |_| {});
         assert!(result.is_err(), "expected Err on startup failure");
         assert_eq!(*call_count.lock().unwrap(), 1, "must not retry on startup failure");
+    }
+
+    #[test]
+    fn supervisor_propagates_internal_error_without_retry() {
+        // RunError::InternalError must NOT be retried — same fail-fast as StartupFailure.
+        let call_count = Arc::new(Mutex::new(0u32));
+        let call_count_clone = call_count.clone();
+
+        let mut supervisor = Supervisor::with_connect_fn(test_config(), move |_cfg, _backoff| {
+            let mut n = call_count_clone.lock().unwrap();
+            *n += 1;
+            Err(RunError::InternalError(anyhow::anyhow!("calloop InvalidToken")))
+        });
+
+        let result = supervisor.run_with_sleep(no_shutdown(), |_| {});
+        assert!(result.is_err(), "expected Err on internal error");
+        assert_eq!(*call_count.lock().unwrap(), 1, "must not retry on internal error");
+    }
+
+    #[test]
+    fn shutdown_flag_set_during_backoff_exits_before_next_connect() {
+        // Scenario: BackendDisconnect happens, then shutdown flag is set *during*
+        // the sleep phase. The supervisor must exit Ok(()) without calling
+        // connect_fn a second time.
+        //
+        // Implementation: the sleep_fn sets the shutdown flag on its first call.
+        let call_count = Arc::new(Mutex::new(0u32));
+        let call_count_clone = call_count.clone();
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_for_sleep = flag.clone();
+
+        let mut supervisor = Supervisor::with_connect_fn(test_config(), move |_cfg, _backoff| {
+            let mut n = call_count_clone.lock().unwrap();
+            *n += 1;
+            Err(RunError::BackendDisconnect)
+        });
+
+        let result = supervisor.run_with_sleep(flag.clone(), move |_d| {
+            // Set the flag on first sleep call — simulates SIGTERM during backoff.
+            flag_for_sleep.store(true, Ordering::Relaxed);
+        });
+
+        assert!(result.is_ok(), "expected Ok when shutdown flag set during backoff");
+        // connect_fn called once (the disconnect); NOT called a second time
+        // because the flag was set during the sleep phase.
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            1,
+            "connect_fn must not be called again after shutdown flag set during backoff"
+        );
+    }
+
+    #[test]
+    fn d11_delay_sequence_captured_correctly() {
+        // Asserts that run_with_sleep passes the correct D11 backoff delays to
+        // the sleep function for two consecutive BackendDisconnect returns.
+        // D11: 1s → 2s → 5s → 10s → 30s
+        let captured = Arc::new(Mutex::new(Vec::<Duration>::new()));
+        let captured_sleep = captured.clone();
+        let call_count = Arc::new(Mutex::new(0u32));
+        let call_count_fn = call_count.clone();
+
+        let mut supervisor = Supervisor::with_connect_fn(test_config(), move |_cfg, backoff| {
+            let mut n = call_count_fn.lock().unwrap();
+            *n += 1;
+            let attempt = *n;
+            drop(n);
+            if attempt <= 2 {
+                Err(RunError::BackendDisconnect)
+            } else {
+                backoff.reset();
+                Ok(ExitReason::Signal)
+            }
+        });
+
+        // Sleep function accumulates all sub-interval calls.
+        supervisor.run_with_sleep(no_shutdown(), |d| {
+            captured_sleep.lock().unwrap().push(d);
+        }).unwrap();
+
+        // run_with_sleep chops each delay into SLEEP_POLL_INTERVAL (50ms) steps.
+        // For a 1s delay: 20 × 50ms steps = 1s total.
+        // For a 2s delay: 40 × 50ms steps = 2s total.
+        // Verify the summed durations match D11 sequence steps 1 and 2.
+        let all_sleeps = captured.lock().unwrap().clone();
+        let first_delay_total: Duration = all_sleeps.iter().take(
+            // Count slices for the first 1s delay
+            (Duration::from_secs(1).as_millis() / SLEEP_POLL_INTERVAL.as_millis()) as usize
+        ).sum();
+        let second_delay_total: Duration = all_sleeps.iter().skip(
+            (Duration::from_secs(1).as_millis() / SLEEP_POLL_INTERVAL.as_millis()) as usize
+        ).sum();
+
+        assert_eq!(first_delay_total, Duration::from_secs(1),
+            "first backoff delay must be 1s (D11)");
+        assert_eq!(second_delay_total, Duration::from_secs(2),
+            "second backoff delay must be 2s (D11)");
     }
 }

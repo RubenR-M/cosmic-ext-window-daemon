@@ -16,6 +16,11 @@ Type=simple
 # If installed system-wide (PREFIX=/usr/local), change to /usr/local/bin/cosmic-ext-window-daemon.
 ExecStart=%h/.local/bin/cosmic-ext-window-daemon
 Restart=on-failure
+# Treat signal-exit as success so that `systemctl stop` is not misclassified
+# as a failure even if the process-level SIGTERM handler fires before calloop's
+# in-loop handler can set ExitReason::Signal. Ensures clean shutdown during
+# backoff windows does not increment the start-limit burst counter.
+SuccessExitStatus=SIGTERM SIGINT
 # Respect the backoff sequence defined in FR-021 (D11): 1s, 2s, 5s, 10s, 30s.
 # RestartSec controls the minimum delay between restarts when Restart=on-failure.
 # Keep it short here; the daemon's own reconnect supervisor handles graduated
