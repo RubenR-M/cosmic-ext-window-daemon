@@ -63,6 +63,35 @@ workspace placement is impossible. Ensure a COSMIC compositor (cosmic-comp >= 1.
 is running and the ext-workspace protocol is available.";
 
 // ---------------------------------------------------------------------------
+// Required-globals guard (A17 / R2.2)
+// ---------------------------------------------------------------------------
+
+/// Validate that both Wayland extension globals are advertised by the compositor.
+///
+/// Extracted as a pure helper so the behavior can be tested without a live compositor.
+/// Called from `connect_and_run` after constructing `ToplevelInfoState` and
+/// `WorkspaceState`. Returns `Err(RunError::StartupFailure(_))` on the FIRST
+/// missing global (D8 fail-fast order: cosmic_toplevel_info before workspace_manager).
+pub(crate) fn check_required_globals(
+    has_cosmic_toplevel_info: bool,
+    has_workspace_manager: bool,
+) -> Result<(), RunError> {
+    if !has_cosmic_toplevel_info {
+        return Err(RunError::StartupFailure(anyhow::anyhow!(
+            "{}",
+            D8_MISSING_COSMIC_TOPLEVEL_INFO
+        )));
+    }
+    if !has_workspace_manager {
+        return Err(RunError::StartupFailure(anyhow::anyhow!(
+            "{}",
+            D8_MISSING_WORKSPACE_MANAGER
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // connect_and_run — one full Wayland session
 // ---------------------------------------------------------------------------
 
@@ -107,17 +136,6 @@ pub fn connect_and_run(
             RunError::StartupFailure(e)
         })?;
 
-    // D8 (extended): cosmic_toplevel_info field must be Some — zcosmic_toplevel_info_v1
-    // is bound with .ok() inside try_new, so a compositor that exposes only
-    // ext-foreign-toplevel-list-v1 (but NOT zcosmic_toplevel_info_v1) passes the
-    // try_new check but silently routes every toplevel to NoCosmicToplevel.
-    // Verified: cosmic-client-toolkit-0.2.0/src/toplevel_info.rs:88-124.
-    if toplevel_info_state.cosmic_toplevel_info.is_none() {
-        let e = anyhow::anyhow!("{}", D8_MISSING_COSMIC_TOPLEVEL_INFO);
-        tracing::error!(error = %e);
-        return Err(RunError::StartupFailure(e));
-    }
-
     // COSMIC toplevel manager — also required.
     let toplevel_manager_state = ToplevelManagerState::try_new(&registry_state, &qh)
         .ok_or_else(|| {
@@ -133,10 +151,18 @@ pub fn connect_and_run(
     // so we must check the required global explicitly after construction.
     // Verified: cosmic-client-toolkit-0.2.0/src/workspace.rs:105-118.
     let workspace_state = WorkspaceState::new(&registry_state, &qh);
-    if workspace_state.workspace_manager().get().is_err() {
-        let e = anyhow::anyhow!("{}", D8_MISSING_WORKSPACE_MANAGER);
+
+    // D8 fail-fast: check both zcosmic_toplevel_info_v1 and ext_workspace_manager_v1.
+    // cosmic_toplevel_info is bound with .ok() inside ToplevelInfoState::try_new, so a
+    // compositor exposing only ext-foreign-toplevel-list-v1 (not zcosmic_toplevel_info_v1)
+    // passes try_new but silently routes every toplevel to NoCosmicToplevel.
+    // Verified: cosmic-client-toolkit-0.2.0/src/toplevel_info.rs:88-124.
+    if let Err(e) = check_required_globals(
+        toplevel_info_state.cosmic_toplevel_info.is_some(),
+        workspace_state.workspace_manager().get().is_ok(),
+    ) {
         tracing::error!(error = %e);
-        return Err(RunError::StartupFailure(e));
+        return Err(e);
     }
 
     // All fallible inserts: wire Wayland source and signal source into the loop
@@ -283,6 +309,64 @@ mod tests {
             matches!(result, Err(RunError::BackendDisconnect)),
             "non-EPROTO IoError must map to BackendDisconnect"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2.2 — check_required_globals: load-bearing tests for D8 guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_required_globals_passes_when_both_present() {
+        assert!(
+            check_required_globals(true, true).is_ok(),
+            "both globals present must return Ok(())"
+        );
+    }
+
+    #[test]
+    fn check_required_globals_fails_d8_when_cosmic_toplevel_info_missing() {
+        let result = check_required_globals(false, true);
+        match result {
+            Err(RunError::StartupFailure(e)) => {
+                assert!(
+                    e.to_string().contains("zcosmic_toplevel_info_v1"),
+                    "error must name the missing protocol, got: {}",
+                    e
+                );
+            }
+            other => panic!("expected StartupFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_required_globals_fails_when_workspace_manager_missing() {
+        let result = check_required_globals(true, false);
+        match result {
+            Err(RunError::StartupFailure(e)) => {
+                assert!(
+                    e.to_string().contains("ext_workspace_manager_v1"),
+                    "error must name the missing protocol, got: {}",
+                    e
+                );
+            }
+            other => panic!("expected StartupFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_required_globals_reports_cosmic_toplevel_first_when_both_missing() {
+        // D8 fail-fast: cosmic_toplevel_info takes priority over workspace_manager.
+        let result = check_required_globals(false, false);
+        match result {
+            Err(RunError::StartupFailure(e)) => {
+                assert!(
+                    e.to_string().contains("zcosmic_toplevel_info_v1"),
+                    "when both missing, must report D8 (zcosmic_toplevel_info_v1) first, got: {}",
+                    e
+                );
+            }
+            other => panic!("expected StartupFailure, got {:?}", other),
+        }
     }
 
     // These tests verify the D8 and workspace-manager error message constants
