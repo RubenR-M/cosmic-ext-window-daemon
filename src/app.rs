@@ -400,10 +400,12 @@ mod tests {
     }
 
     #[test]
-    fn d8_ext_foreign_toplevel_error_message_is_non_empty() {
+    fn d8_ext_foreign_toplevel_error_message_names_the_protocol() {
         assert!(
-            !D8_MISSING_EXT_FOREIGN_TOPLEVEL.is_empty(),
-            "ext-foreign-toplevel error message must not be empty"
+            D8_MISSING_EXT_FOREIGN_TOPLEVEL.contains("ext-foreign-toplevel-list-v1"),
+            "D8 ext-foreign-toplevel error message must name the missing protocol \
+             (ext-foreign-toplevel-list-v1); got: {}",
+            D8_MISSING_EXT_FOREIGN_TOPLEVEL
         );
     }
 }
