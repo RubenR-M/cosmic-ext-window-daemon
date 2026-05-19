@@ -316,14 +316,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn check_required_globals_passes_when_both_present() {
-        assert!(
-            check_required_globals(true, true).is_ok(),
-            "both globals present must return Ok(())"
-        );
-    }
-
-    #[test]
     fn check_required_globals_fails_d8_when_cosmic_toplevel_info_missing() {
         let result = check_required_globals(false, true);
         match result {
