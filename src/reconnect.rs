@@ -225,7 +225,6 @@ where
         // These coexist with calloop's Signals source: when the event loop is
         // running, calloop delivers signals via signalfd (happy path). When the
         // event loop has exited (backoff window), these handlers fire instead.
-        // SAFETY: we install a simple async-signal-safe handler (atomic store).
         // sigaction(2) can fail with EFAULT or EINVAL, or be refused by a hardened
         // sandbox. If it fails we log a warning and continue: the daemon still
         // functions, but SIGTERM during a backoff sleep will use the default
