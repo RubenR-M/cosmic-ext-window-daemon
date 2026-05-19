@@ -253,7 +253,7 @@ pub(crate) fn map_calloop_error(e: calloop::Error) -> Result<ExitReason, RunErro
                     io_err
                 )))
             } else {
-                tracing::warn!("Wayland backend I/O error; attempting reconnect");
+                tracing::warn!(error = %io_err, "Wayland backend I/O error; attempting reconnect");
                 Err(RunError::BackendDisconnect)
             }
         }
