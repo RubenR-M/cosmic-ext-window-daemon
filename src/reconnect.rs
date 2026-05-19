@@ -92,6 +92,9 @@ pub enum RunError {
     /// `DispatchError::Backend` from calloop-wayland-source: compositor
     /// disconnected. Supervisor backs off and retries (FR-021).
     BackendDisconnect,
+    /// Non-I/O calloop error (InvalidToken, OtherError) indicating an internal
+    /// logic fault. Not retried — same fail-fast behavior as StartupFailure.
+    InternalError(anyhow::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -99,6 +102,7 @@ impl std::fmt::Display for RunError {
         match self {
             RunError::StartupFailure(e) => write!(f, "startup failure: {}", e),
             RunError::BackendDisconnect => write!(f, "Wayland compositor disconnected"),
+            RunError::InternalError(e) => write!(f, "internal event loop error: {}", e),
         }
     }
 }
@@ -108,6 +112,7 @@ impl std::error::Error for RunError {
         match self {
             RunError::StartupFailure(e) => Some(e.as_ref()),
             RunError::BackendDisconnect => None,
+            RunError::InternalError(e) => Some(e.as_ref()),
         }
     }
 }
@@ -177,7 +182,7 @@ where
                     // Continue loop — backoff.reset() is called inside connect_fn
                     // on successful connect+roundtrip (design §6.5).
                 }
-                Err(RunError::StartupFailure(e)) => {
+                Err(RunError::StartupFailure(e)) | Err(RunError::InternalError(e)) => {
                     return Err(e);
                 }
             }
