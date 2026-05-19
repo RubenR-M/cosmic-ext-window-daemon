@@ -244,6 +244,8 @@ pub(crate) fn map_calloop_error(e: calloop::Error) -> Result<ExitReason, RunErro
     match e {
         calloop::Error::IoError(ref io_err) => {
             let raw = io_err.raw_os_error();
+            // Defensive: calloop-wayland-source 0.4.1 only emits EPROTO; EBADMSG is included
+            // in case upstream behavior changes in a future version.
             if raw == Some(nix::errno::Errno::EPROTO as i32)
                 || raw == Some(nix::errno::Errno::EBADMSG as i32)
             {
