@@ -44,7 +44,19 @@ const BACKOFF_STEPS: &[Duration] = &[
 ];
 
 /// Poll interval during backoff sleep — how often we check the shutdown flag.
-/// Must be short enough that SIGTERM is acted upon within 100ms.
+///
+/// Max latency from signal arrival to flag check = one poll interval = 50ms.
+/// Why: `std::thread::sleep` loops on EINTR with the remaining time (see
+/// `std/sys/thread/unix.rs`), so EINTR never escapes to the caller — either
+/// `SA_RESTART` lets the kernel transparently restart, or std restarts in
+/// userspace. Either way the sleep runs to full duration; the only way to
+/// interrupt it is to poll before each sub-interval, which is what the
+/// backoff loop below does.
+///
+/// Why this handler at all: calloop's `Signals` source blocks SIGTERM/SIGINT
+/// on the event-loop thread and delivers them via signalfd. Once the event loop
+/// returns and `Signals` drops, the signal mask is unblocked. This process-level
+/// handler covers the backoff-sleep window between loop iterations.
 const SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
