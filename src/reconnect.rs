@@ -213,6 +213,12 @@ where
         // These coexist with calloop's Signals source: when the event loop is
         // running, calloop delivers signals via signalfd (happy path). When the
         // event loop has exited (backoff window), these handlers fire instead.
+        // SAFETY: we install a simple async-signal-safe handler (atomic store).
+        // sigaction(2) can fail with EFAULT or EINVAL, or be refused by a hardened
+        // sandbox. If it fails we log a warning and continue: the daemon still
+        // functions, but SIGTERM during a backoff sleep will use the default
+        // disposition (process killed immediately) rather than the graceful 50ms
+        // poll. This is a known, documented degradation — not a silent failure.
         unsafe {
             use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal};
             let sa = SigAction::new(
@@ -220,9 +226,18 @@ where
                 SaFlags::SA_RESTART,
                 SigSet::empty(),
             );
-            // Ignore error: if sigaction fails we degrade gracefully (no handler).
-            let _ = nix::sys::signal::sigaction(Signal::SIGTERM, &sa);
-            let _ = nix::sys::signal::sigaction(Signal::SIGINT, &sa);
+            if let Err(e) = nix::sys::signal::sigaction(Signal::SIGTERM, &sa) {
+                tracing::warn!(
+                    error = %e,
+                    "sigaction(SIGTERM) failed; shutdown during backoff will use default disposition"
+                );
+            }
+            if let Err(e) = nix::sys::signal::sigaction(Signal::SIGINT, &sa) {
+                tracing::warn!(
+                    error = %e,
+                    "sigaction(SIGINT) failed; shutdown during backoff will use default disposition"
+                );
+            }
         }
 
         self.run_with_sleep(flag, std::thread::sleep)
