@@ -43,8 +43,9 @@ disable:
 	systemctl --user stop $(SERVICE)
 	systemctl --user disable $(SERVICE)
 
-# Lint the systemd unit file. Run locally or in CI.
-# systemd-analyze is part of systemd itself — no extra package needed on
-# Arch/Fedora/Debian-based distros. GitHub Actions ubuntu-latest includes it.
+# Lint the systemd unit file. Run locally before pushing.
+# systemd-analyze verify also checks that ExecStart points to an existing
+# executable, so it cannot run in CI where the binary is not installed.
+# Run locally: `make verify-unit` — exit 0 means the unit file is clean.
 verify-unit:
 	systemd-analyze verify contrib/$(SERVICE)
