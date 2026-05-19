@@ -194,7 +194,7 @@ pub fn connect_and_run(
     //
     // calloop 0.14: run() returns Err(calloop::Error::...) on dispatch failure;
     // we discriminate the error variant to distinguish backend disconnects from
-    // internal loop errors (A17 / issue #3).
+    // internal loop errors and Wayland protocol violations (A16).
     //
     // timeout=None → block forever until a source requests stop (our signal handler).
     match event_loop.run(None, &mut app_data, |_app| {}) {
@@ -202,23 +202,39 @@ pub fn connect_and_run(
             // event_loop.run returned Ok — the signal handler called stop().
             Ok(ExitReason::Signal)
         }
-        Err(e) => {
-            // Discriminate calloop error variants:
-            // - IoError typically originates from the WaylandSource (compositor disconnect).
-            //   Map to BackendDisconnect for retry.
-            // - InvalidToken or OtherError are internal/unexpected failures.
-            //   Map to InternalError — supervisor will NOT retry.
-            match e {
-                calloop::Error::IoError(_) => {
-                    tracing::warn!("Wayland backend I/O error; attempting reconnect");
-                    Err(RunError::BackendDisconnect)
-                }
-                other => {
-                    let ae = anyhow::anyhow!("calloop internal error: {}", other);
-                    tracing::error!(error = %ae, "non-recoverable event loop error");
-                    Err(RunError::InternalError(ae))
-                }
+        Err(e) => map_calloop_error(e),
+    }
+}
+
+/// Map a `calloop::Error` to a `RunError`.
+///
+/// - `IoError` with `raw_os_error() == EPROTO` or `EBADMSG`: Wayland protocol
+///   violation (calloop-wayland-source 0.4.1 surfaces both as EPROTO). Reconnecting
+///   would immediately reproduce the same violation, so this routes to `InternalError`
+///   rather than `BackendDisconnect`. See calloop-wayland-source 0.4.1 src/lib.rs:252-256.
+/// - All other `IoError`: compositor disconnected normally → `BackendDisconnect` for retry.
+/// - `InvalidToken` / `OtherError`: internal logic fault → `InternalError`, not retried.
+pub(crate) fn map_calloop_error(e: calloop::Error) -> Result<ExitReason, RunError> {
+    match e {
+        calloop::Error::IoError(ref io_err) => {
+            let raw = io_err.raw_os_error();
+            if raw == Some(nix::errno::Errno::EPROTO as i32)
+                || raw == Some(nix::errno::Errno::EBADMSG as i32)
+            {
+                tracing::error!("wayland protocol violation: {}", io_err);
+                Err(RunError::InternalError(anyhow::anyhow!(
+                    "Wayland protocol violation (EPROTO/EBADMSG): {}",
+                    io_err
+                )))
+            } else {
+                tracing::warn!("Wayland backend I/O error; attempting reconnect");
+                Err(RunError::BackendDisconnect)
             }
+        }
+        other => {
+            let ae = anyhow::anyhow!("calloop internal error: {}", other);
+            tracing::error!(error = %ae, "non-recoverable event loop error");
+            Err(RunError::InternalError(ae))
         }
     }
 }
@@ -230,6 +246,44 @@ pub fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // R2.1 — map_calloop_error: EPROTO/EBADMSG must route to InternalError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_calloop_error_eproto_routes_to_internal_error() {
+        let io_err = std::io::Error::from_raw_os_error(nix::errno::Errno::EPROTO as i32);
+        let calloop_err = calloop::Error::IoError(io_err);
+        let result = map_calloop_error(calloop_err);
+        assert!(
+            matches!(result, Err(RunError::InternalError(_))),
+            "EPROTO must map to InternalError, not BackendDisconnect"
+        );
+    }
+
+    #[test]
+    fn map_calloop_error_ebadmsg_routes_to_internal_error() {
+        let io_err = std::io::Error::from_raw_os_error(nix::errno::Errno::EBADMSG as i32);
+        let calloop_err = calloop::Error::IoError(io_err);
+        let result = map_calloop_error(calloop_err);
+        assert!(
+            matches!(result, Err(RunError::InternalError(_))),
+            "EBADMSG must map to InternalError, not BackendDisconnect"
+        );
+    }
+
+    #[test]
+    fn map_calloop_error_generic_io_routes_to_backend_disconnect() {
+        // A plain I/O error (e.g. ECONNRESET) must still map to BackendDisconnect.
+        let io_err = std::io::Error::from_raw_os_error(nix::errno::Errno::ECONNRESET as i32);
+        let calloop_err = calloop::Error::IoError(io_err);
+        let result = map_calloop_error(calloop_err);
+        assert!(
+            matches!(result, Err(RunError::BackendDisconnect)),
+            "non-EPROTO IoError must map to BackendDisconnect"
+        );
+    }
 
     // These tests verify the D8 and workspace-manager error message constants
     // are present and non-empty (strategy: source-of-truth constants are tested
