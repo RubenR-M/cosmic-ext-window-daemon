@@ -26,4 +26,5 @@ calloop-wayland-source = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+nix = { version = "0.31", features = ["signal"] }
 regex = "1"

@@ -120,9 +120,6 @@ pub struct AppData {
     /// WorkspaceHandler::done() cycle for the new workspace to appear before
     /// degrading to next-free placement.
     pub pending_placements: Vec<crate::runtime::PendingPlacement>,
-
-    /// LoopSignal cached here so signal handlers can call stop() cleanly.
-    pub loop_signal: calloop::LoopSignal,
 }
 
 impl AppData {
