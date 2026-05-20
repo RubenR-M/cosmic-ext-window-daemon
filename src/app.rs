@@ -7,10 +7,19 @@
 //   - one `calloop::EventLoop<'static, AppData>`
 //   - one `AppData` constructed from scratch (FR-021: no stale state survives)
 //
-// The function returns:
-//   - `Ok(ExitReason::Signal)` when SIGTERM/SIGINT is received (FR-022).
-//   - `Err(RunError::BackendDisconnect)` on compositor disconnect (FR-021).
-//   - `Err(RunError::StartupFailure(_))` for non-recoverable init errors (FR-002).
+// Returns:
+//   - Ok(ExitReason::Signal) when SIGTERM/SIGINT is received (FR-022).
+//   - Err(RunError::BackendDisconnect) on:
+//       * compositor disconnect mid-session (FR-021), or
+//       * Connection::connect_to_env() / registry_queue_init() failure
+//         when WAYLAND_DISPLAY is set (transient compositor unavailability
+//         during reconnect or first-boot window).
+//   - Err(RunError::StartupFailure(_)) for:
+//       * WAYLAND_DISPLAY (and WAYLAND_SOCKET) both unset (FR-001),
+//       * missing cosmic protocol globals (FR-002 / D8),
+//       * non-recoverable local-resource failures (calloop/signal init).
+//   - Err(RunError::InternalError(_)) for protocol violations and other
+//     non-IO calloop errors (no retry; see map_calloop_error).
 //
 // D8 fail-fast: ToplevelInfoState::try_new returning None → StartupFailure.
 // D8 also requires cosmic_toplevel_info field to be Some (zcosmic_toplevel_info_v1
@@ -104,6 +113,25 @@ pub fn connect_and_run(
     config: &Arc<Config>,
     backoff: &mut BackoffState,
 ) -> Result<ExitReason, RunError> {
+    // Pre-check: a permanently-missing Wayland session indicates a daemon
+    // launched outside any graphical session. Distinguish this from the
+    // transient "compositor restarting" path so the daemon exits 1 instead
+    // of looping forever (FR-001 / Phase 4 manual test). Once a display or
+    // socket env var is set, subsequent connect failures fall through to
+    // BackendDisconnect for the reconnect supervisor.
+    if std::env::var_os("WAYLAND_DISPLAY")
+        .filter(|v| !v.is_empty())
+        .is_none()
+        && std::env::var_os("WAYLAND_SOCKET").is_none()
+    {
+        let e = anyhow::anyhow!(
+            "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set; \
+             cosmic-ext-window-daemon requires a Wayland session"
+        );
+        tracing::error!(error = %e);
+        return Err(RunError::StartupFailure(e));
+    }
+
     // FR-001 / FR-021 — connect to the Wayland compositor.
     // Classification: connect-layer failure is transient (compositor may not
     // be up yet on first boot, or has died during a reconnect attempt). The
@@ -283,13 +311,14 @@ pub(crate) fn map_calloop_error(e: calloop::Error) -> Result<ExitReason, RunErro
     }
 }
 
-/// Walk an error's `source()` chain looking for the innermost
-/// `std::io::Error`; return its `raw_os_error()` if found.
+/// Walk an error's `source()` chain top-down and return the
+/// `raw_os_error()` of the FIRST node that downcasts to `std::io::Error`.
 ///
-/// Needed because calloop wraps source errors as
-/// `OtherError(Box<dyn Error>)` and the real `io::Error` can sit several
-/// levels deep behind that boxed dyn. See `map_calloop_error` for the
-/// classification policy that consumes the returned errno.
+/// For calloop 0.14.4's observed error shapes that first hit is always
+/// the leaf io::Error (calloop never wraps an io::Error inside another
+/// io::Error), so "first" and "innermost" coincide in practice. The
+/// naming is kept conservative to avoid making a stronger claim than the
+/// implementation enforces.
 fn walk_for_io_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = cur {
@@ -393,6 +422,35 @@ mod tests {
         assert!(
             matches!(result, Err(RunError::InternalError(_))),
             "OtherError(Box<IoError(EBADMSG)>) must map to InternalError (no retry)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2.1c — map_calloop_error: None path (no io::Error in chain)
+    //
+    // Errors with no io::Error anywhere in the source chain must route to
+    // InternalError (no retry). Covers InvalidToken and OtherError wrapping
+    // a non-IO payload.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_calloop_error_invalid_token_routes_to_internal_error() {
+        let result = map_calloop_error(calloop::Error::InvalidToken);
+        assert!(
+            matches!(result, Err(RunError::InternalError(_))),
+            "InvalidToken (no io::Error in chain) must map to InternalError"
+        );
+    }
+
+    #[test]
+    fn map_calloop_error_other_error_without_io_routes_to_internal_error() {
+        let inner: Box<dyn std::error::Error + Send + Sync> =
+            "non-io payload".to_string().into();
+        let calloop_err = calloop::Error::OtherError(inner);
+        let result = map_calloop_error(calloop_err);
+        assert!(
+            matches!(result, Err(RunError::InternalError(_))),
+            "OtherError wrapping a non-io error must map to InternalError"
         );
     }
 

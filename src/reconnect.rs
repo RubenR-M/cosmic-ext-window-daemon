@@ -137,8 +137,9 @@ pub enum ExitReason {
 /// Error from a single `connect_and_run` iteration.
 #[derive(Debug)]
 pub enum RunError {
-    /// Startup failure: missing Wayland extension (FR-002), bad config, or
-    /// non-recoverable init error. Not retried — propagates to main().
+    /// Startup failure: missing Wayland extension OR no Wayland session env
+    /// vars set (FR-001 / FR-002); non-recoverable local-resource init errors.
+    /// Not retried — propagates to main().
     StartupFailure(anyhow::Error),
     /// `DispatchError::Backend` from calloop-wayland-source: compositor
     /// disconnected. Supervisor backs off and retries (FR-021).
