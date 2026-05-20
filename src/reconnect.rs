@@ -137,14 +137,19 @@ pub enum ExitReason {
 /// Error from a single `connect_and_run` iteration.
 #[derive(Debug)]
 pub enum RunError {
-    /// Startup failure: missing Wayland extension (FR-002), bad config, or
-    /// non-recoverable init error. Not retried — propagates to main().
+    /// Startup failure: missing Wayland extension OR no Wayland session env
+    /// vars set (FR-001 / FR-002); non-recoverable local-resource init errors.
+    /// Not retried — propagates to main().
     StartupFailure(anyhow::Error),
     /// `DispatchError::Backend` from calloop-wayland-source: compositor
     /// disconnected. Supervisor backs off and retries (FR-021).
     BackendDisconnect,
-    /// Non-I/O calloop error (InvalidToken, OtherError) indicating an internal
-    /// logic fault. Not retried — same fail-fast behavior as StartupFailure.
+    /// Non-I/O calloop error: `InvalidToken`, or `OtherError` with NO
+    /// `io::Error` anywhere in its source chain. Indicates an internal logic
+    /// fault. Not retried — same fail-fast behavior as StartupFailure.
+    /// (A22: `OtherError` carrying an `io::Error` is reclassified by
+    /// `app::map_calloop_error` to BackendDisconnect / InternalError based
+    /// on the inner errno; see `walk_for_io_errno`.)
     InternalError(anyhow::Error),
 }
 
