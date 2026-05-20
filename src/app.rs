@@ -12,10 +12,11 @@
 //   - Err(RunError::BackendDisconnect) on:
 //       * compositor disconnect mid-session (FR-021), or
 //       * Connection::connect_to_env() / registry_queue_init() failure
-//         when WAYLAND_DISPLAY is set (transient compositor unavailability
-//         during reconnect or first-boot window).
+//         when WAYLAND_DISPLAY (non-empty) or WAYLAND_SOCKET (non-empty)
+//         is set (transient compositor unavailability during reconnect
+//         or first-boot window).
 //   - Err(RunError::StartupFailure(_)) for:
-//       * WAYLAND_DISPLAY (and WAYLAND_SOCKET) both unset (FR-001),
+//       * WAYLAND_DISPLAY and WAYLAND_SOCKET both unset/empty (FR-001),
 //       * missing cosmic protocol globals (FR-002 / D8),
 //       * non-recoverable local-resource failures (calloop/signal init).
 //   - Err(RunError::InternalError(_)) for protocol violations and other
@@ -116,13 +117,20 @@ pub fn connect_and_run(
     // Pre-check: a permanently-missing Wayland session indicates a daemon
     // launched outside any graphical session. Distinguish this from the
     // transient "compositor restarting" path so the daemon exits 1 instead
-    // of looping forever (FR-001 / Phase 4 manual test). Once a display or
-    // socket env var is set, subsequent connect failures fall through to
-    // BackendDisconnect for the reconnect supervisor.
+    // of looping forever (FR-001 / Phase 4 manual test).
+    //
+    // WAYLAND_DISPLAY is the persistent reconnect address — once it's set,
+    // subsequent connect failures fall through to BackendDisconnect.
+    // WAYLAND_SOCKET is a one-shot FD that libwayland consumes on first
+    // connect (wayland-client-0.31 conn.rs uses env::remove_var). If it was
+    // the only session var, this guard correctly fires on the NEXT iteration
+    // and exits 1 — no reconnect address is available.
     if std::env::var_os("WAYLAND_DISPLAY")
         .filter(|v| !v.is_empty())
         .is_none()
-        && std::env::var_os("WAYLAND_SOCKET").is_none()
+        && std::env::var_os("WAYLAND_SOCKET")
+            .filter(|v| !v.is_empty())
+            .is_none()
     {
         let e = anyhow::anyhow!(
             "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set; \
@@ -276,7 +284,7 @@ pub fn connect_and_run(
 /// returning from `event_loop.run()` — so the production Wayland disconnect
 /// surfaces as `OtherError(Box<IoError(_)>)`, NOT a flat `IoError`. To stay
 /// correct under both representations, walk the `source()` chain looking for
-/// the innermost `std::io::Error` and discriminate on its `raw_os_error()`.
+/// the first `std::io::Error` and discriminate on its `raw_os_error()`.
 ///
 /// Classification (after `walk_for_io_errno`):
 /// - `Some(EPROTO | EBADMSG)`: Wayland protocol violation

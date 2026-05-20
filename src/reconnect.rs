@@ -144,8 +144,12 @@ pub enum RunError {
     /// `DispatchError::Backend` from calloop-wayland-source: compositor
     /// disconnected. Supervisor backs off and retries (FR-021).
     BackendDisconnect,
-    /// Non-I/O calloop error (InvalidToken, OtherError) indicating an internal
-    /// logic fault. Not retried — same fail-fast behavior as StartupFailure.
+    /// Non-I/O calloop error: `InvalidToken`, or `OtherError` with NO
+    /// `io::Error` anywhere in its source chain. Indicates an internal logic
+    /// fault. Not retried — same fail-fast behavior as StartupFailure.
+    /// (A22: `OtherError` carrying an `io::Error` is reclassified by
+    /// `app::map_calloop_error` to BackendDisconnect / InternalError based
+    /// on the inner errno; see `walk_for_io_errno`.)
     InternalError(anyhow::Error),
 }
 
