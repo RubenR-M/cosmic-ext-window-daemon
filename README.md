@@ -141,8 +141,6 @@ cargo build --release --locked
 # Full test suite — 101 effective tests
 # (100 unit tests + 1 trybuild compile_fail integration test
 #  with 3 sub-cases that enforce the D15 Layer 1 commit gate)
-# (100 unit tests + 1 trybuild compile_fail integration test
-#  with 3 sub-cases that enforce the D15 Layer 1 commit gate)
 cargo test --locked
 
 # Lint (D15 Layer 2 gate — must be clean before pushing)
