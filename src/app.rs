@@ -133,7 +133,7 @@ pub fn connect_and_run(
             .is_none()
     {
         let e = anyhow::anyhow!(
-            "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set; \
+            "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set to a non-empty value; \
              cosmic-ext-window-daemon requires a Wayland session"
         );
         tracing::error!(error = %e);
@@ -322,11 +322,11 @@ pub(crate) fn map_calloop_error(e: calloop::Error) -> Result<ExitReason, RunErro
 /// Walk an error's `source()` chain top-down and return the
 /// `raw_os_error()` of the FIRST node that downcasts to `std::io::Error`.
 ///
-/// For calloop 0.14.4's observed error shapes that first hit is always
-/// the leaf io::Error (calloop never wraps an io::Error inside another
-/// io::Error), so "first" and "innermost" coincide in practice. The
-/// naming is kept conservative to avoid making a stronger claim than the
-/// implementation enforces.
+/// For calloop 0.14.4's observed error shapes there is at most one
+/// `io::Error` in the chain (calloop never wraps an `io::Error` inside
+/// another `io::Error`), so "first" is unambiguous — the only `io::Error`
+/// present, if any. The function makes no stronger promise than "first
+/// match found by top-down walk".
 fn walk_for_io_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = cur {
