@@ -104,14 +104,23 @@ pub fn connect_and_run(
     config: &Arc<Config>,
     backoff: &mut BackoffState,
 ) -> Result<ExitReason, RunError> {
-    // FR-001 — connect to the Wayland compositor.
+    // FR-001 / FR-021 — connect to the Wayland compositor.
+    // Classification: connect-layer failure is transient (compositor may not
+    // be up yet on first boot, or has died during a reconnect attempt). The
+    // supervisor must keep retrying with backoff until SIGTERM. Routing this
+    // to BackendDisconnect preserves D11 semantics; only a missing protocol
+    // (handled by check_required_globals below) is the permanent fail-fast.
     let conn = Connection::connect_to_env().map_err(|e| {
-        RunError::StartupFailure(anyhow::anyhow!("failed to connect to Wayland compositor: {}", e))
+        tracing::warn!(error = %e, "Wayland connect failed; will retry per backoff");
+        RunError::BackendDisconnect
     })?;
 
     // Initial registry roundtrip + global inspection.
+    // Classification: same as connect — a registry roundtrip can fail
+    // mid-handshake if the compositor is restarting. Route to backoff.
     let (globals, event_queue) = registry_queue_init::<AppData>(&conn).map_err(|e| {
-        RunError::StartupFailure(anyhow::anyhow!("registry_queue_init failed: {}", e))
+        tracing::warn!(error = %e, "Wayland registry_queue_init failed; will retry per backoff");
+        RunError::BackendDisconnect
     })?;
     let qh = event_queue.handle();
 
@@ -234,37 +243,62 @@ pub fn connect_and_run(
 
 /// Map a `calloop::Error` to a `RunError`.
 ///
-/// - `IoError` with `raw_os_error() == EPROTO` or `EBADMSG`: Wayland protocol
-///   violation (calloop-wayland-source 0.4.1 surfaces both as EPROTO). Reconnecting
-///   would immediately reproduce the same violation, so this routes to `InternalError`
-///   rather than `BackendDisconnect`. See calloop-wayland-source 0.4.1 src/lib.rs:252-256.
-/// - All other `IoError`: compositor disconnected normally → `BackendDisconnect` for retry.
-/// - `InvalidToken` / `OtherError`: internal logic fault → `InternalError`, not retried.
+/// At runtime calloop's generic dispatcher boxes a source's `Error` and
+/// re-wraps it as `calloop::Error::OtherError(Box<dyn Error>)` before
+/// returning from `event_loop.run()` — so the production Wayland disconnect
+/// surfaces as `OtherError(Box<IoError(_)>)`, NOT a flat `IoError`. To stay
+/// correct under both representations, walk the `source()` chain looking for
+/// the innermost `std::io::Error` and discriminate on its `raw_os_error()`.
+///
+/// Classification (after `walk_for_io_errno`):
+/// - `Some(EPROTO | EBADMSG)`: Wayland protocol violation
+///   (calloop-wayland-source 0.4.1 src/lib.rs:252-256 surfaces both as EPROTO;
+///   EBADMSG is kept defensively for future upstream changes). Reconnecting
+///   would immediately reproduce the same violation → `InternalError` (no retry).
+/// - `Some(_)` (any other errno, e.g. EPIPE, ECONNRESET): compositor
+///   disconnected → `BackendDisconnect` (retry with backoff per D11).
+/// - `None` (no `io::Error` anywhere in the chain): true internal logic fault
+///   (`InvalidToken`, allocator failure, etc.) → `InternalError`.
 pub(crate) fn map_calloop_error(e: calloop::Error) -> Result<ExitReason, RunError> {
-    match e {
-        calloop::Error::IoError(ref io_err) => {
-            let raw = io_err.raw_os_error();
-            // Defensive: calloop-wayland-source 0.4.1 only emits EPROTO; EBADMSG is included
-            // in case upstream behavior changes in a future version.
-            if raw == Some(nix::errno::Errno::EPROTO as i32)
-                || raw == Some(nix::errno::Errno::EBADMSG as i32)
-            {
-                tracing::error!("wayland protocol violation: {}", io_err);
-                Err(RunError::InternalError(anyhow::anyhow!(
-                    "Wayland protocol violation (EPROTO/EBADMSG): {}",
-                    io_err
-                )))
-            } else {
-                tracing::warn!(error = %io_err, "Wayland backend I/O error; attempting reconnect");
-                Err(RunError::BackendDisconnect)
-            }
+    match walk_for_io_errno(&e) {
+        Some(raw)
+            if raw == nix::errno::Errno::EPROTO as i32
+                || raw == nix::errno::Errno::EBADMSG as i32 =>
+        {
+            tracing::error!(error = %e, "wayland protocol violation");
+            Err(RunError::InternalError(anyhow::anyhow!(
+                "Wayland protocol violation (EPROTO/EBADMSG): {}",
+                e
+            )))
         }
-        other => {
-            let ae = anyhow::anyhow!("calloop internal error: {}", other);
+        Some(_) => {
+            tracing::warn!(error = %e, "Wayland backend I/O error; attempting reconnect");
+            Err(RunError::BackendDisconnect)
+        }
+        None => {
+            let ae = anyhow::anyhow!("calloop internal error: {}", e);
             tracing::error!(error = %ae, "non-recoverable event loop error");
             Err(RunError::InternalError(ae))
         }
     }
+}
+
+/// Walk an error's `source()` chain looking for the innermost
+/// `std::io::Error`; return its `raw_os_error()` if found.
+///
+/// Needed because calloop wraps source errors as
+/// `OtherError(Box<dyn Error>)` and the real `io::Error` can sit several
+/// levels deep behind that boxed dyn. See `map_calloop_error` for the
+/// classification policy that consumes the returned errno.
+fn walk_for_io_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return io.raw_os_error();
+        }
+        cur = err.source();
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +344,55 @@ mod tests {
         assert!(
             matches!(result, Err(RunError::BackendDisconnect)),
             "non-EPROTO IoError must map to BackendDisconnect"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2.1b — map_calloop_error: nested OtherError(Box) wraps (runtime path)
+    //
+    // calloop's generic dispatcher boxes a source's Error and re-wraps it as
+    // calloop::Error::OtherError(Box<dyn Error>) before returning from
+    // event_loop.run(). The runtime Wayland disconnect therefore surfaces as
+    // OtherError(Box<IoError(_)>) — NOT the flat IoError used in R2.1. These
+    // tests cover that production path (FR-021).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_calloop_error_nested_other_epipe_routes_to_backend_disconnect() {
+        let inner = calloop::Error::IoError(std::io::Error::from_raw_os_error(
+            nix::errno::Errno::EPIPE as i32,
+        ));
+        let calloop_err = calloop::Error::OtherError(Box::new(inner));
+        let result = map_calloop_error(calloop_err);
+        assert!(
+            matches!(result, Err(RunError::BackendDisconnect)),
+            "OtherError(Box<IoError(EPIPE)>) must map to BackendDisconnect (runtime disconnect path)"
+        );
+    }
+
+    #[test]
+    fn map_calloop_error_nested_other_eproto_routes_to_internal_error() {
+        let inner = calloop::Error::IoError(std::io::Error::from_raw_os_error(
+            nix::errno::Errno::EPROTO as i32,
+        ));
+        let calloop_err = calloop::Error::OtherError(Box::new(inner));
+        let result = map_calloop_error(calloop_err);
+        assert!(
+            matches!(result, Err(RunError::InternalError(_))),
+            "OtherError(Box<IoError(EPROTO)>) must map to InternalError (no retry)"
+        );
+    }
+
+    #[test]
+    fn map_calloop_error_nested_other_ebadmsg_routes_to_internal_error() {
+        let inner = calloop::Error::IoError(std::io::Error::from_raw_os_error(
+            nix::errno::Errno::EBADMSG as i32,
+        ));
+        let calloop_err = calloop::Error::OtherError(Box::new(inner));
+        let result = map_calloop_error(calloop_err);
+        assert!(
+            matches!(result, Err(RunError::InternalError(_))),
+            "OtherError(Box<IoError(EBADMSG)>) must map to InternalError (no retry)"
         );
     }
 
