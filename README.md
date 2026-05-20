@@ -16,13 +16,19 @@ cd cosmic-ext-window-daemon
 # Build + install (writes ~/.local/bin/cosmic-ext-window-daemon + service file)
 make install
 
-# Enable the user service
-systemctl --user daemon-reload
+# Enable the user service (`make install` already ran daemon-reload)
 systemctl --user enable --now cosmic-ext-window-daemon.service
 
 # Confirm
 systemctl --user status cosmic-ext-window-daemon.service
 journalctl --user -fu cosmic-ext-window-daemon.service
+```
+
+## Uninstall
+
+```sh
+systemctl --user disable --now cosmic-ext-window-daemon.service
+make uninstall
 ```
 
 ## Requirements
@@ -99,6 +105,8 @@ After a successful reconnect the backoff cursor resets to 1s.
 
 ## Troubleshooting
 
+The daemon writes all output to the systemd journal (`StandardOutput=journal` / `StandardError=journal`). Use `journalctl --user -u cosmic-ext-window-daemon.service` (add `-f` to follow) to inspect.
+
 ### Daemon exits immediately
 
 Run `journalctl --user -u cosmic-ext-window-daemon.service -n 50`. The fail-fast table above maps diagnostics to causes.
@@ -115,13 +123,13 @@ Check `journalctl --user -fu cosmic-ext-window-daemon.service`. The daemon logs 
 - Does the toplevel have any output advertised? (Skipped with WARN if not.)
 - Is the `zcosmic_toplevel_info_v1` protocol present? (Daemon exits 1 at startup if not.)
 
-### Verifying the systemd unit file before install
+### Verifying the systemd unit file
+
+Run after `make install` (the binary path in `ExecStart` must exist for `systemd-analyze verify` to succeed):
 
 ```sh
 make verify-unit   # runs: systemd-analyze verify contrib/cosmic-ext-window-daemon.service
 ```
-
-`systemd-analyze verify` also checks that `ExecStart` points to an existing executable, so run this after `make install`, not on a fresh checkout.
 
 ## Development
 
@@ -129,8 +137,10 @@ make verify-unit   # runs: systemd-analyze verify contrib/cosmic-ext-window-daem
 # Build
 cargo build --release --locked
 
-# Test suite (100 effective tests as of A22)
-cargo test --lib --locked
+# Full test suite — 101 effective tests as of A22
+# (100 unit tests + 1 trybuild compile_fail integration test
+#  with 3 sub-cases that enforce the D15 Layer 1 commit gate)
+cargo test --locked
 
 # Lint (D15 Layer 2 gate — must be clean before pushing)
 cargo clippy --all-targets -- -D warnings
