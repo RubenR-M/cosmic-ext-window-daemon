@@ -5,7 +5,7 @@ cosmic-ext-window-daemon stands on the shoulders of:
 | Project | What it provides |
 |---------|------------------|
 | [pop-os/cosmic-protocols](https://github.com/pop-os/cosmic-protocols) | Wayland protocol definitions for the COSMIC extension (toplevel-info, toplevel-management, workspace). Pinned at `=0.2.0`. |
-| [pop-os/cosmic-client-toolkit](https://github.com/pop-os/cosmic-protocols/tree/160b086abe03cd34a8a375d7fbe47b24308d1f38/client-toolkit) | Rust toolkit for COSMIC client protocols (`ToplevelInfoState`, `ToplevelManagerState`, `WorkspaceState`). Pinned at `=0.2.0`. |
+| [pop-os/cosmic-client-toolkit](https://github.com/pop-os/cosmic-protocols/tree/160b086abe03cd34a8a375d7fbe47b24308d1f38/client-toolkit) (commit 160b086 — v0.2.0 release on crates.io, 2026-01-08) | Rust toolkit for COSMIC client protocols (`ToplevelInfoState`, `ToplevelManagerState`, `WorkspaceState`). Pinned at `=0.2.0`. |
 | [smithay/smithay-client-toolkit](https://github.com/Smithay/client-toolkit) | Generic Wayland client toolkit (registry, output, seat handlers). |
 | [smithay/calloop](https://github.com/Smithay/calloop) | Event loop crate. The reconnect supervisor wraps `calloop::EventLoop`. |
 | [Smithay/calloop-wayland-source](https://github.com/Smithay/calloop-wayland-source) | Bridge between `calloop` and `wayland-client`. |

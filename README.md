@@ -16,7 +16,7 @@ cd cosmic-ext-window-daemon
 # Build + install (writes ~/.local/bin/cosmic-ext-window-daemon + service file)
 make install
 
-# Enable the user service (`make install` already ran daemon-reload)
+# Enable the user service (daemon-reload already done by make install)
 systemctl --user enable --now cosmic-ext-window-daemon.service
 
 # Confirm
@@ -27,9 +27,10 @@ journalctl --user -fu cosmic-ext-window-daemon.service
 ## Uninstall
 
 ```sh
-systemctl --user disable --now cosmic-ext-window-daemon.service
 make uninstall
 ```
+
+`make uninstall` stops and disables the service, then removes the binary and the unit file.
 
 ## Requirements
 
@@ -137,7 +138,9 @@ make verify-unit   # runs: systemd-analyze verify contrib/cosmic-ext-window-daem
 # Build
 cargo build --release --locked
 
-# Full test suite — 101 effective tests as of A22
+# Full test suite — 101 effective tests
+# (100 unit tests + 1 trybuild compile_fail integration test
+#  with 3 sub-cases that enforce the D15 Layer 1 commit gate)
 # (100 unit tests + 1 trybuild compile_fail integration test
 #  with 3 sub-cases that enforce the D15 Layer 1 commit gate)
 cargo test --locked
