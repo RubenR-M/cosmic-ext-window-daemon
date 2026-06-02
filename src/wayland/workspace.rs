@@ -210,6 +210,20 @@ impl WorkspaceHandler for AppData {
     fn done(&mut self) {
         use wayland_client::Proxy as _;
 
+        // MRU producer (D3 / FR-MRU-006). Gated on Config.jump_on_empty (D5):
+        // zero overhead when the feature is off (function is not called).
+        // Placed FIRST in done() per OQ-4 resolution (design §5.1 + §11.1):
+        // records all active-bit transitions visible in the current batch before
+        // the verifier confirm walk or scan_pending_placements may issue new activates.
+        if self.config.jump_on_empty {
+            crate::mru_jump::update_mru_from_active_transitions(
+                &mut self.last_known_active,
+                &mut self.recent_workspaces,
+                &self.workspace_state,
+                crate::mru_jump::MRU_CAP,
+            );
+        }
+
         // Collect (handle_id, is_active) pairs from the settled workspace state.
         // We must collect because we borrow self.workspace_state immutably while
         // self.verifier and self.pending_tokens need mutable access afterward.

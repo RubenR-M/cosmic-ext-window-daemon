@@ -29,7 +29,7 @@
 //
 // Implemented in T-020 (reconnect loop) / T-021 (entrypoint wiring).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -259,6 +259,8 @@ pub fn connect_and_run(
         seat: None,
         new_each_counter: 0,
         pending_placements: Vec::new(),
+        recent_workspaces: VecDeque::with_capacity(crate::mru_jump::MRU_CAP),
+        last_known_active: HashMap::new(),
     };
 
     // Run the event loop — blocks until loop_signal.stop() or a dispatch error.

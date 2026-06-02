@@ -99,6 +99,13 @@ impl ToplevelInfoHandler for AppData {
         self.handled.remove(&closed_id);
         self.pending_placements
             .retain(|p| p.foreign_toplevel_id != closed_id);
+
+        // MRU jump trigger (T-MRU-005 / FR-MRU-001 / D1).
+        // Gated on config.jump_on_empty: zero overhead when the feature is off.
+        // All trigger-evaluation logic lives in runtime::handle_empty_workspace_if_triggered.
+        if self.config.jump_on_empty {
+            crate::runtime::handle_empty_workspace_if_triggered(self, &closed_id);
+        }
     }
 
     // info_done and finished use the default no-op impls from the trait.
