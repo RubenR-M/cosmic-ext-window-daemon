@@ -56,7 +56,7 @@ All configuration is via environment variables, read at startup. Unknown or malf
 | `WORKSPACE_OUTPUT` | (none) | Override: name of the output whose workspace group receives all toplevels (e.g. `DP-1`). Falls back to per-toplevel output selection when the named output is absent; emits WARN at most once. |
 | `EXCLUDED_APP_IDS` | (none) | Comma-separated `app_id` values to skip (case-sensitive, e.g. `org.kde.dolphin,foot`). |
 | `EXCLUDED_TITLE_REGEX` | (none) | Regular expression matched against toplevel titles. Toplevels whose title matches are skipped. Invalid regex exits 1 at startup. |
-| `JUMP_ON_EMPTY` | `0` | If `1`, when the last window on your active workspace closes the daemon automatically activates the most-recently-visited workspace in the same group that still has windows. Falls back to the workspace with the lowest index when no MRU entry is available. Default `0` (opt-in). |
+| `JUMP_ON_EMPTY` | `0` | If `1`, when the last window on your active workspace closes the daemon automatically activates the most-recently-visited workspace in the same group that still has windows. Falls back to the workspace with the lowest index **that still has windows** when no MRU entry is available. Default `0` (opt-in). |
 
 ### Drop-in override pattern
 
@@ -95,7 +95,7 @@ After a successful reconnect the backoff cursor resets to 1s.
 
 ### MRU jump on empty workspace
 
-When `JUMP_ON_EMPTY=1`, the daemon watches for the moment your active workspace becomes empty (the last window on it closes). At that point it activates the most-recently-visited workspace in the same group that still has at least one window. If no such MRU entry exists (e.g. fresh daemon start with no prior workspace switches), it falls back to the workspace with the lowest index in the group. If every other workspace in the group is also empty, no activation is issued and the compositor keeps its current view.
+When `JUMP_ON_EMPTY=1`, the daemon watches for the moment your active workspace becomes empty (the last window on it closes). At that point it activates the most-recently-visited workspace in the same group that still has at least one window. If no such MRU entry exists (e.g. fresh daemon start with no prior workspace switches), it falls back to the workspace with the lowest index **that still has windows** in the group. If every other workspace in the group is also empty, no activation is issued and the compositor keeps its current view.
 
 The feature is scoped to the group that owns the closing window's workspace — a close on monitor 1 never triggers a jump on monitor 2. MRU history is reset on compositor reconnect (the daemon drops all state on disconnect per its reconnect policy). Enable `RUST_LOG=debug` to see per-close diagnostic output; at the default `info` level only successful jumps are logged.
 
