@@ -20,6 +20,7 @@
 pub mod app;
 pub mod config;
 pub mod ids;
+pub(crate) mod mru_jump;
 pub mod placement;
 pub mod reconnect;
 pub mod runtime;
