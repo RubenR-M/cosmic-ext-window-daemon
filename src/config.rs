@@ -39,6 +39,9 @@ pub struct Config {
     pub excluded_title_regex: Option<Regex>,
     /// None when env var is absent or empty.
     pub workspace_output: Option<String>,
+    /// When true, jump to the MRU workspace in the same group when the active
+    /// workspace becomes empty on toplevel close. Default false (opt-in).
+    pub jump_on_empty: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +67,7 @@ pub fn from_env_source(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<C
     let excluded_title_regex =
         parse_excluded_title_regex(get("EXCLUDED_TITLE_REGEX").as_deref())?;
     let workspace_output = parse_workspace_output(get("WORKSPACE_OUTPUT").as_deref());
+    let jump_on_empty = parse_bool("JUMP_ON_EMPTY", get("JUMP_ON_EMPTY").as_deref())?;
 
     Ok(Config {
         workspace_mode,
@@ -73,6 +77,7 @@ pub fn from_env_source(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<C
         excluded_app_ids,
         excluded_title_regex,
         workspace_output,
+        jump_on_empty,
     })
 }
 
@@ -180,6 +185,7 @@ mod tests {
         assert!(cfg.excluded_app_ids.is_empty());
         assert!(cfg.excluded_title_regex.is_none());
         assert!(cfg.workspace_output.is_none());
+        assert!(!cfg.jump_on_empty);
     }
 
     // --- WorkspaceMode ---
@@ -361,5 +367,44 @@ mod tests {
     fn from_env_source_workspace_output_is_none_when_absent() {
         let cfg = from_env_source(|_| None).unwrap();
         assert!(cfg.workspace_output.is_none());
+    }
+
+    // --- jump_on_empty ---
+
+    #[test]
+    fn jump_on_empty_default_false() {
+        let cfg = from_env_source(|_| None).unwrap();
+        assert!(!cfg.jump_on_empty, "JUMP_ON_EMPTY absent => false");
+    }
+
+    #[test]
+    fn jump_on_empty_parses_true() {
+        for raw in ["1", "true", "on", "yes", "TRUE", "YES", "ON"] {
+            let cfg = from_env_source(env(&[("JUMP_ON_EMPTY", raw)])).unwrap_or_else(|e| {
+                panic!("expected {:?} to parse as true, got error: {}", raw, e);
+            });
+            assert!(cfg.jump_on_empty, "{:?} should parse as true", raw);
+        }
+    }
+
+    #[test]
+    fn jump_on_empty_parses_false() {
+        for raw in ["0", "false", "off", "no", "FALSE", "NO", "OFF"] {
+            let cfg = from_env_source(env(&[("JUMP_ON_EMPTY", raw)])).unwrap_or_else(|e| {
+                panic!("expected {:?} to parse as false, got error: {}", raw, e);
+            });
+            assert!(!cfg.jump_on_empty, "{:?} should parse as false", raw);
+        }
+    }
+
+    #[test]
+    fn jump_on_empty_invalid_errors() {
+        let err = from_env_source(env(&[("JUMP_ON_EMPTY", "maybe")])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("JUMP_ON_EMPTY"), "error should mention the var: {msg}");
+        assert!(
+            msg.contains("unrecognized value"),
+            "error should say 'unrecognized value': {msg}"
+        );
     }
 }

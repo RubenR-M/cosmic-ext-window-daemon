@@ -411,6 +411,7 @@ mod tests {
             excluded_app_ids: vec![],
             excluded_title_regex: None,
             workspace_output: None,
+            jump_on_empty: false,
         }
     }
 
