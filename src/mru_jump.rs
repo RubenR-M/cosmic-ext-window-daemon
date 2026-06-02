@@ -11,8 +11,6 @@
 // ExtWorkspaceGroupHandleV1::create_workspace, or ext_workspace_manager_v1::commit.
 // The clippy::disallowed_methods lint (src/lib.rs) covers this file automatically.
 
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque, HashSet};
 
 use crate::ids::WorkspaceId;
@@ -38,9 +36,148 @@ pub struct WorkspaceMeta {
     pub id: WorkspaceId,
     /// Workspace coordinates from the ext-workspace-v1 protocol field.
     pub coordinates: Vec<u32>,
-    /// Identity of the group this workspace belongs to:
-    /// `group.handle.id().protocol_id() as u64`.
-    pub group_id: u64,
+}
+
+// ---------------------------------------------------------------------------
+// evaluate_trigger — pure trigger-evaluation function
+// ---------------------------------------------------------------------------
+
+/// Input to evaluate_trigger — captures everything the trigger-evaluation
+/// step reads, in a form that can be constructed from a unit test.
+pub struct TriggerInput<'a> {
+    /// Workspaces the CLOSED toplevel was on (D9 case 4: may be 0, 1, or >1).
+    pub closed_workspaces: &'a [WorkspaceMeta],
+    /// For each workspace the closing toplevel was on, is_active flag.
+    /// Indexed by WorkspaceId.
+    pub is_active: &'a HashMap<WorkspaceId, bool>,
+    /// For each workspace the closing toplevel was on, occupancy count
+    /// EXCLUDING the closing handle (per FR-MRU-002).
+    pub occupied_excluding_closed: &'a HashMap<WorkspaceId, usize>,
+    /// Group membership per workspace (group protocol_id) keyed by WorkspaceId.
+    /// `None` value = orphaned workspace (covers the case_no_group anomaly path).
+    pub group_id_for: &'a HashMap<WorkspaceId, Option<u64>>,
+    /// All workspaces per group (for fallback ordering by coordinates[0]).
+    pub group_workspaces: &'a HashMap<u64, Vec<WorkspaceMeta>>,
+    /// Per-group occupied workspace IDs (any workspace with ≥1 toplevel,
+    /// excluding the closing handle).
+    pub group_occupied: &'a HashMap<u64, HashSet<WorkspaceId>>,
+    /// MRU deque (global, filtered by group at query time).
+    pub recent_mru: &'a VecDeque<WorkspaceId>,
+}
+
+/// Outcome from evaluate_trigger — drives both the activation dispatch
+/// AND the tracing emission.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TriggerOutcome {
+    /// Fire activation. `source` is the now-empty active workspace; `target`
+    /// is the next workspace to activate; `group_id` is shared between them.
+    Jump {
+        source: WorkspaceId,
+        target: WorkspaceId,
+        group_id: u64,
+    },
+    /// No activation. `reason` drives the tracing label.
+    NoOp { reason: NoOpReason },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NoOpReason {
+    /// Closed toplevel had zero workspace handles (D9 — previously silent).
+    NoWorkspace,
+    /// All workspaces the closed toplevel was on are non-active. D9 case 1.
+    NotActive,
+    /// The closing toplevel's workspace still has other toplevels. D9 case 2.
+    StillOccupied { ws: WorkspaceId },
+    /// No eligible target — group is empty after excluding the source. D9 case 3.
+    NoTarget { group_id: u64, source: WorkspaceId },
+    /// Workspace orphaned from group (group_data.is_none).
+    /// Previously overloaded as "no_target"; now a distinct case.
+    NoGroup { ws: WorkspaceId },
+    /// Multi-workspace toplevel with no per-handle match (D9 case 4).
+    /// Coalesces all per-handle no-ops into ONE outcome.
+    MultiWorkspaceNoMatch { handle_count: usize },
+}
+
+/// Evaluate whether the just-closed toplevel's workspace should trigger a jump.
+///
+/// Pure: no Wayland types, no `&mut AppData`, no I/O.
+/// The caller (`handle_empty_workspace_if_triggered`) is responsible for
+/// collecting the inputs from live Wayland state and dispatching the result.
+pub fn evaluate_trigger(input: &TriggerInput<'_>) -> TriggerOutcome {
+    // 1. Closed toplevel had no workspaces.
+    if input.closed_workspaces.is_empty() {
+        return TriggerOutcome::NoOp { reason: NoOpReason::NoWorkspace };
+    }
+
+    // 2. Multi-workspace handling — iterate handles; first Jump wins; if all
+    //    no-op AND count > 1, coalesce to MultiWorkspaceNoMatch.
+    let multi = input.closed_workspaces.len() > 1;
+    let mut last_single_reason: Option<NoOpReason> = None;
+
+    for ws in input.closed_workspaces {
+        // 3. is_active check.
+        let active = input.is_active.get(&ws.id).copied().unwrap_or(false);
+        if !active {
+            if !multi {
+                return TriggerOutcome::NoOp { reason: NoOpReason::NotActive };
+            }
+            last_single_reason = Some(NoOpReason::NotActive);
+            continue;
+        }
+
+        // 4. Occupancy check (FR-MRU-002 — already excludes closing handle).
+        let occupied = input.occupied_excluding_closed.get(&ws.id).copied().unwrap_or(0);
+        if occupied > 0 {
+            if !multi {
+                return TriggerOutcome::NoOp { reason: NoOpReason::StillOccupied { ws: ws.id } };
+            }
+            last_single_reason = Some(NoOpReason::StillOccupied { ws: ws.id });
+            continue;
+        }
+
+        // 5. Group resolution.
+        let group_id = match input.group_id_for.get(&ws.id).and_then(|x| x.as_ref()) {
+            Some(g) => *g,
+            None => {
+                if !multi {
+                    return TriggerOutcome::NoOp { reason: NoOpReason::NoGroup { ws: ws.id } };
+                }
+                last_single_reason = Some(NoOpReason::NoGroup { ws: ws.id });
+                continue;
+            }
+        };
+
+        // 6. Run select_jump_target via the existing pure selector.
+        let occupied_in_group = input.group_occupied.get(&group_id).cloned().unwrap_or_default();
+        let group_workspaces = input.group_workspaces.get(&group_id).cloned().unwrap_or_default();
+
+        match select_jump_target(ws.id, &group_workspaces, &occupied_in_group, input.recent_mru) {
+            Some(target) => {
+                return TriggerOutcome::Jump { source: ws.id, target, group_id };
+            }
+            None => {
+                if !multi {
+                    return TriggerOutcome::NoOp {
+                        reason: NoOpReason::NoTarget { group_id, source: ws.id },
+                    };
+                }
+                last_single_reason = Some(NoOpReason::NoTarget { group_id, source: ws.id });
+                continue;
+            }
+        }
+    }
+
+    // 7. Multi-workspace coalescing.
+    if multi {
+        return TriggerOutcome::NoOp {
+            reason: NoOpReason::MultiWorkspaceNoMatch {
+                handle_count: input.closed_workspaces.len(),
+            },
+        };
+    }
+
+    // Fallback (single-handle path — should not be reached if loop ran).
+    TriggerOutcome::NoOp { reason: last_single_reason.unwrap_or(NoOpReason::NoWorkspace) }
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +198,7 @@ pub struct WorkspaceMeta {
 ///
 /// # Preconditions
 /// The caller has already verified that `current_ws_id` is active and now empty.
-/// Trigger filtering happens in `runtime::handle_empty_workspace_if_triggered`.
+/// Trigger filtering happens in `evaluate_trigger`.
 pub fn select_jump_target(
     current_ws_id: WorkspaceId,
     group_workspaces: &[WorkspaceMeta],
@@ -183,8 +320,8 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    fn make_meta(id: WorkspaceId, coordinates: Vec<u32>, group_id: u64) -> WorkspaceMeta {
-        WorkspaceMeta { id, coordinates, group_id }
+    fn make_meta(id: WorkspaceId, coordinates: Vec<u32>) -> WorkspaceMeta {
+        WorkspaceMeta { id, coordinates }
     }
 
     fn occupied(ids: &[WorkspaceId]) -> HashSet<WorkspaceId> {
@@ -204,10 +341,10 @@ mod tests {
         // deque = [3, 2, 1]; current = 5; group = {1, 2, 3, 5}; occupied = {1, 2, 3}
         // Expects 3 (front of deque, in group, occupied, not current).
         let metas = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(2, vec![1], 10),
-            make_meta(3, vec![2], 10),
-            make_meta(5, vec![4], 10),
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
+            make_meta(3, vec![2]),
+            make_meta(5, vec![4]),
         ];
         let occ = occupied(&[1, 2, 3]);
         let rec = recent(&[3, 2, 1]);
@@ -218,10 +355,10 @@ mod tests {
     fn select_jump_target_skips_unoccupied_mru_entries() {
         // deque = [3, 2, 1]; occupied = {1} only; expects 1 (skip 3 and 2).
         let metas = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(2, vec![1], 10),
-            make_meta(3, vec![2], 10),
-            make_meta(5, vec![4], 10),
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
+            make_meta(3, vec![2]),
+            make_meta(5, vec![4]),
         ];
         let occ = occupied(&[1]);
         let rec = recent(&[3, 2, 1]);
@@ -233,8 +370,8 @@ mod tests {
         // Group A = {1, 2}. deque = [99, 100, 1]; 99 and 100 are in group B (not in metas).
         // Expects 1 (first deque entry that IS in group A).
         let metas = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(2, vec![1], 10),
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
         ];
         let occ = occupied(&[1, 2, 99, 100]);
         let rec = recent(&[99, 100, 1]);
@@ -245,8 +382,8 @@ mod tests {
     fn select_jump_target_skips_current_in_mru() {
         // deque = [5, 2]; current = 5; expects 2 (skip current).
         let metas = vec![
-            make_meta(2, vec![1], 10),
-            make_meta(5, vec![4], 10),
+            make_meta(2, vec![1]),
+            make_meta(5, vec![4]),
         ];
         let occ = occupied(&[2, 5]);
         let rec = recent(&[5, 2]);
@@ -260,11 +397,11 @@ mod tests {
     #[test]
     fn select_jump_target_falls_back_to_lowest_coordinate() {
         // MRU empty; group = {ws1 coord [0], ws5 coord [4]}; occupied = {ws1, ws5}; current = ws3.
-        // Expects ws1 (lowest coord).
+        // Expects ws1 (lowest coord, still occupied).
         let metas = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(5, vec![4], 10),
-            make_meta(3, vec![2], 10),
+            make_meta(1, vec![0]),
+            make_meta(5, vec![4]),
+            make_meta(3, vec![2]),
         ];
         let occ = occupied(&[1, 5]);
         let rec = recent(&[]);
@@ -275,9 +412,9 @@ mod tests {
     fn select_jump_target_fallback_tiebreaks_on_protocol_id() {
         // Two workspaces share coordinates [0]; lower id wins.
         let metas = vec![
-            make_meta(10, vec![0], 20),
-            make_meta(7, vec![0], 20),
-            make_meta(99, vec![2], 20),
+            make_meta(10, vec![0]),
+            make_meta(7, vec![0]),
+            make_meta(99, vec![2]),
         ];
         let occ = occupied(&[7, 10, 99]);
         let rec = recent(&[]);
@@ -292,7 +429,7 @@ mod tests {
     #[test]
     fn select_jump_target_returns_none_when_current_is_only_workspace() {
         // Single-workspace group; current is the only member → None.
-        let metas = vec![make_meta(1, vec![0], 10)];
+        let metas = vec![make_meta(1, vec![0])];
         let occ = occupied(&[]);
         let rec = recent(&[]);
         assert_eq!(select_jump_target(1, &metas, &occ, &rec), None);
@@ -302,8 +439,8 @@ mod tests {
     fn select_jump_target_returns_none_when_fallback_is_current() {
         // Group = {current=1, ws2}; ws2 not occupied; current is only candidate → None.
         let metas = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(2, vec![1], 10),
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
         ];
         let occ = occupied(&[]);
         let rec = recent(&[]);
@@ -376,106 +513,274 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T-MRU-008 integration tests (pure-function level; no compositor needed)
+    // evaluate_trigger tests (8 cases — round 1 fixes #2/#3/#5/#6/#7/#8)
     // -----------------------------------------------------------------------
 
-    /// SC-MRU-004 / FR-MRU-009:
-    /// When jump_on_empty is false, MRU bookkeeping must produce zero output.
-    /// Simulated here by calling the pure detect_transitions_and_update directly
-    /// with no update path (the guard in done() prevents calls entirely).
     #[test]
-    fn jump_on_empty_false_bookkeeping_and_trigger_inert() {
-        // When jump_on_empty=false, done() doesn't call update_mru_from_active_transitions.
-        // Simulate: start with fresh state, ensure no transitions fire when we
-        // manually skip the update (feature-off contract verified structurally).
-        let mut last: HashMap<u64, u64> = HashMap::new();
-        let deque: VecDeque<u64> = VecDeque::new();
+    fn evaluate_trigger_jumps_when_active_and_empty_with_mru_target() {
+        // ws2 is active, empty (occupancy 0 after closing), group 10 has ws1 + ws2.
+        // MRU = [ws1]. Expects Jump { source: 2, target: 1, group_id: 10 }.
+        let closed = vec![make_meta(2, vec![1])];
+        let is_active: HashMap<WorkspaceId, bool> = [(2, true)].into();
+        let occ_excl: HashMap<WorkspaceId, usize> = [(2, 0)].into();
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> = [(2, Some(10))].into();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = [(10u64, vec![
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
+        ])].into();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = [(10u64, [1u64].into())].into();
+        let mru: VecDeque<WorkspaceId> = [1u64].into();
 
-        // Feature is off — no calls to record_mru_transition.
-        // Verify that the initial state is completely empty (FR-MRU-011).
-        assert!(deque.is_empty(), "recent_workspaces must start empty");
-        assert!(last.is_empty(), "last_known_active must start empty");
-
-        // Simulate a transition event that WOULD fire if the feature were on.
-        // Since we're testing feature-off, we assert that manually skipping the
-        // call leaves deque unchanged.
-        let transitions = detect_transitions_and_update(&mut last, &[(10u64, 42u64)]);
-        // Above was called directly to populate last_known_active, simulating a
-        // feature-ON scenario. Now verify that if we had NOT called it, deque stays empty:
-        for _ws_id in &transitions {
-            // Feature-off: this loop body would be skipped.
-            // We verify by calling record_mru_transition only in the feature-on path.
-        }
-        assert!(deque.is_empty(), "deque must be empty when feature is off (no record_mru_transition calls)");
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::Jump { source: 2, target: 1, group_id: 10 },
+        );
     }
 
-    /// FR-MRU-011: two independent AppData instances both start with empty state.
     #[test]
-    fn mru_state_is_fresh_on_new_appdata() {
-        // Simulate two independent "AppData" instances by creating two independent
-        // (deque, last_known_active) pairs — each starts completely empty.
-        let deque1: VecDeque<u64> = VecDeque::with_capacity(MRU_CAP);
-        let last1: HashMap<u64, u64> = HashMap::new();
+    fn evaluate_trigger_not_active_yields_not_active() {
+        // ws2 is NOT active. Expects NoOp { reason: NotActive }.
+        let closed = vec![make_meta(2, vec![1])];
+        let is_active: HashMap<WorkspaceId, bool> = [(2, false)].into();
+        let occ_excl: HashMap<WorkspaceId, usize> = [(2, 0)].into();
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> = [(2, Some(10))].into();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = HashMap::new();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = HashMap::new();
+        let mru: VecDeque<WorkspaceId> = VecDeque::new();
 
-        let deque2: VecDeque<u64> = VecDeque::with_capacity(MRU_CAP);
-        let last2: HashMap<u64, u64> = HashMap::new();
-
-        assert!(deque1.is_empty(), "first instance: recent_workspaces must be empty");
-        assert!(last1.is_empty(), "first instance: last_known_active must be empty");
-        assert!(deque2.is_empty(), "second instance: recent_workspaces must be empty");
-        assert!(last2.is_empty(), "second instance: last_known_active must be empty");
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::NoOp { reason: NoOpReason::NotActive },
+        );
     }
+
+    #[test]
+    fn evaluate_trigger_still_occupied_yields_still_occupied() {
+        // ws2 is active but still has 1 other toplevel after excluding closing handle.
+        let closed = vec![make_meta(2, vec![1])];
+        let is_active: HashMap<WorkspaceId, bool> = [(2, true)].into();
+        let occ_excl: HashMap<WorkspaceId, usize> = [(2, 1)].into();
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> = [(2, Some(10))].into();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = HashMap::new();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = HashMap::new();
+        let mru: VecDeque<WorkspaceId> = VecDeque::new();
+
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::NoOp { reason: NoOpReason::StillOccupied { ws: 2 } },
+        );
+    }
+
+    #[test]
+    fn evaluate_trigger_no_target_yields_no_target() {
+        // ws2 is active, empty, group 10 has only ws2 (no other occupied workspace).
+        let closed = vec![make_meta(2, vec![1])];
+        let is_active: HashMap<WorkspaceId, bool> = [(2, true)].into();
+        let occ_excl: HashMap<WorkspaceId, usize> = [(2, 0)].into();
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> = [(2, Some(10))].into();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = [(10u64, vec![make_meta(2, vec![1])])].into();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = [(10u64, HashSet::new())].into();
+        let mru: VecDeque<WorkspaceId> = VecDeque::new();
+
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::NoOp { reason: NoOpReason::NoTarget { group_id: 10, source: 2 } },
+        );
+    }
+
+    /// Finding #6 — zero workspace handles emits NoWorkspace (was previously silent).
+    #[test]
+    fn evaluate_trigger_no_workspace_yields_no_workspace() {
+        let closed: Vec<WorkspaceMeta> = vec![];
+        let is_active: HashMap<WorkspaceId, bool> = HashMap::new();
+        let occ_excl: HashMap<WorkspaceId, usize> = HashMap::new();
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> = HashMap::new();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = HashMap::new();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = HashMap::new();
+        let mru: VecDeque<WorkspaceId> = VecDeque::new();
+
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::NoOp { reason: NoOpReason::NoWorkspace },
+        );
+    }
+
+    /// Finding #7 — orphaned workspace (None group) emits NoGroup (was "no_target").
+    #[test]
+    fn evaluate_trigger_orphan_group_yields_no_group() {
+        let closed = vec![make_meta(2, vec![1])];
+        let is_active: HashMap<WorkspaceId, bool> = [(2, true)].into();
+        let occ_excl: HashMap<WorkspaceId, usize> = [(2, 0)].into();
+        // None value signals orphaned workspace.
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> = [(2, None)].into();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = HashMap::new();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = HashMap::new();
+        let mru: VecDeque<WorkspaceId> = VecDeque::new();
+
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::NoOp { reason: NoOpReason::NoGroup { ws: 2 } },
+        );
+    }
+
+    /// Finding #8 — multi-workspace toplevel with no match coalesces to ONE outcome.
+    #[test]
+    fn evaluate_trigger_multi_workspace_no_match_coalesces() {
+        // Toplevel on ws2 + ws3; neither is active. Expects MultiWorkspaceNoMatch { handle_count: 2 }.
+        let closed = vec![make_meta(2, vec![1]), make_meta(3, vec![2])];
+        let is_active: HashMap<WorkspaceId, bool> = [(2, false), (3, false)].into();
+        let occ_excl: HashMap<WorkspaceId, usize> = [(2, 0), (3, 0)].into();
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> = [(2, Some(10)), (3, Some(10))].into();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = HashMap::new();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = HashMap::new();
+        let mru: VecDeque<WorkspaceId> = VecDeque::new();
+
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::NoOp { reason: NoOpReason::MultiWorkspaceNoMatch { handle_count: 2 } },
+        );
+    }
+
+    /// Multi-workspace toplevel where the FIRST workspace produces a jump.
+    #[test]
+    fn evaluate_trigger_multi_workspace_jumps_on_first_match() {
+        // Toplevel on ws2 (active, empty) + ws3 (not active).
+        // ws2 triggers a jump to ws1. ws3 is never evaluated.
+        let closed = vec![make_meta(2, vec![1]), make_meta(3, vec![2])];
+        let is_active: HashMap<WorkspaceId, bool> = [(2, true), (3, false)].into();
+        let occ_excl: HashMap<WorkspaceId, usize> = [(2, 0), (3, 0)].into();
+        let group_id_for: HashMap<WorkspaceId, Option<u64>> =
+            [(2, Some(10)), (3, Some(10))].into();
+        let group_ws: HashMap<u64, Vec<WorkspaceMeta>> = [(10u64, vec![
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
+        ])].into();
+        let group_occ: HashMap<u64, HashSet<WorkspaceId>> = [(10u64, [1u64].into())].into();
+        let mru: VecDeque<WorkspaceId> = [1u64].into();
+
+        let input = TriggerInput {
+            closed_workspaces: &closed,
+            is_active: &is_active,
+            occupied_excluding_closed: &occ_excl,
+            group_id_for: &group_id_for,
+            group_workspaces: &group_ws,
+            group_occupied: &group_occ,
+            recent_mru: &mru,
+        };
+        assert_eq!(
+            evaluate_trigger(&input),
+            TriggerOutcome::Jump { source: 2, target: 1, group_id: 10 },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature-off structural contract (replaces two vacuous tests)
+    // -----------------------------------------------------------------------
+
+    /// Documents the contract that the caller (toplevel_closed / done()) MUST
+    /// guard the call to evaluate_trigger behind `if config.jump_on_empty`.
+    /// The guards are verified by reading src/wayland/{workspace,toplevel}.rs
+    /// which use `if self.config.jump_on_empty` before any MRU-related call.
+    #[test]
+    fn feature_off_config_means_evaluate_trigger_is_never_called() {
+        let config_off = crate::config::from_env_source(|_| None).unwrap();
+        assert!(!config_off.jump_on_empty);
+        // The actual feature-off guards are at:
+        // - src/wayland/workspace.rs::WorkspaceHandler::done (MRU producer)
+        // - src/wayland/toplevel.rs::ToplevelInfoHandler::toplevel_closed (trigger)
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy integration-level tests kept (pure-function level; no compositor)
+    // -----------------------------------------------------------------------
 
     /// SC-MRU-005: two toplevels on ws-2; close T-A first (occupancy still 1) → no jump;
     /// close T-B next (occupancy 0) → trigger should proceed to target selection.
     /// Tested at the occupancy-check level via the pure select_jump_target.
     #[test]
     fn trigger_fires_exactly_once_when_workspace_empties_gradually() {
-        // Group G: ws1, ws2. Both occupied. Current active = ws2.
-        // T-A is on ws2; T-B is also on ws2; ws1 has T-C.
-        //
-        // Close T-A: occupancy of ws2 excluding T-A = 1 (T-B still there).
-        // At this point we'd return early in handle_empty_workspace_if_triggered.
-        // Close T-B: occupancy of ws2 excluding T-B = 0 → call select_jump_target.
-        // select_jump_target should return ws1.
-
         let metas = vec![
-            make_meta(1, vec![0], 10), // ws1
-            make_meta(2, vec![1], 10), // ws2 (active, closing)
+            make_meta(1, vec![0]), // ws1
+            make_meta(2, vec![1]), // ws2 (active, closing)
         ];
-
-        // Scenario A: ws2 still has T-B (occupancy = 1 after excluding T-A) → no-op.
-        // The occupancy check (before calling select_jump_target) would bail out.
-        // We simulate only the select_jump_target invocation that would happen on the second close.
 
         // Scenario B: ws2 is empty after T-B closes; ws1 is occupied.
         let occ_after_tb = occupied(&[1]); // only ws1 still has a toplevel
         let rec = recent(&[]);
         let result = select_jump_target(2, &metas, &occ_after_tb, &rec);
         assert_eq!(result, Some(1), "second close (ws2 empty) must jump to ws1");
-
-        // Confirm that occupancy check would have prevented the first close from jumping:
-        // (not calling select_jump_target; this is the guard in handle_empty_workspace_if_triggered)
-        // Here we just document that occupancy = 1 means the function returns early.
-        // The guard is: if occupancy > 0 { debug!(case = "still_occupied"); continue; }
     }
 
     /// FR-MRU-002: occupancy check must exclude the closing handle.
-    /// If we accidentally counted the closing toplevel, ws-2 would appear occupied
-    /// even when it's the only toplevel closing — causing a missed jump.
     #[test]
     fn occupancy_check_excludes_closing_handle() {
-        // Simulate: ws2 has exactly one toplevel (the one being closed).
-        // After excluding closed_id, occupancy = 0.
-        // The pure select_jump_target receives occupied = {} for ws2 and should
-        // proceed to jump to ws1.
         let metas = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(2, vec![1], 10),
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
         ];
-
-        // Occupied from the exclusive perspective (closed handle excluded):
-        // ws1 has a toplevel; ws2 has ONLY the closing toplevel (excluded) → ws2 not in occupied.
         let occ = occupied(&[1]); // ws2 NOT in occupied because closed handle excluded
         let rec = recent(&[]);
         let result = select_jump_target(2, &metas, &occ, &rec);
@@ -486,28 +791,16 @@ mod tests {
     /// when it is occupied, or when there is no valid target.
     #[test]
     fn trigger_fires_only_when_workspace_is_active_and_empty() {
-        // Negative case 1: workspace is not active (handled by the is_active guard
-        // in handle_empty_workspace_if_triggered — pure test approximation).
-        // We test the pure target-selection: if the workspace doesn't appear as
-        // "current" to select_jump_target but isn't in the group's occupied set,
-        // there's nothing to jump FROM. The actual is_active check is in the
-        // Wayland integration layer and is tested manually (SC-MRU-001).
-
-        // Negative case 2: workspace still occupied (select_jump_target given a
-        // non-empty occupied set for current workspace — the guard prevents the call,
-        // but the pure function's semantics are: skip current in step 1 and step 2).
-        let metas_single = vec![make_meta(1, vec![0], 10)];
-        let occ_with_only_current = occupied(&[1]); // ws1 is "occupied" but also current
-        // select_jump_target skips current in step 2 → None
+        let metas_single = vec![make_meta(1, vec![0])];
+        let occ_with_only_current = occupied(&[1]);
         let result = select_jump_target(1, &metas_single, &occ_with_only_current, &recent(&[]));
         assert_eq!(result, None, "sole workspace → None (no valid target)");
 
-        // Negative case 3: no target exists (all other workspaces are unoccupied).
         let metas_two = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(2, vec![1], 10),
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
         ];
-        let occ_empty = occupied(&[]); // nothing occupied
+        let occ_empty = occupied(&[]);
         let result = select_jump_target(2, &metas_two, &occ_empty, &recent(&[]));
         assert_eq!(result, None, "no occupied target → None");
     }
@@ -515,13 +808,11 @@ mod tests {
     /// SC-MRU-003: select_jump_target returns None when current is the only workspace.
     #[test]
     fn select_jump_target_returns_none_when_current_is_only_occupied() {
-        // All workspaces except current are unoccupied.
         let metas = vec![
-            make_meta(1, vec![0], 10),
-            make_meta(2, vec![1], 10),
-            make_meta(3, vec![2], 10),
+            make_meta(1, vec![0]),
+            make_meta(2, vec![1]),
+            make_meta(3, vec![2]),
         ];
-        // Only current ws=1 is occupied (but it's excluded from step 2 by design).
         let occ = occupied(&[1]);
         let rec = recent(&[]);
         let result = select_jump_target(1, &metas, &occ, &rec);
