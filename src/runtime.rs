@@ -499,9 +499,12 @@ pub(crate) fn handle_empty_workspace_if_triggered(
             Some(i) => i.workspace.iter().cloned().collect(),
             None => {
                 // Should not happen per toolkit guarantee, but handle gracefully.
+                // Distinct from the D9 NoWorkspace case (ToplevelData found but its
+                // workspace set is empty): this path means ToplevelData itself was
+                // missing at handler call time.
                 tracing::debug!(
                     closed_toplevel_id = %closed_id,
-                    case = "no_workspace",
+                    case = "toplevel_not_found",
                     "jump trigger no-op: ToplevelInfo not found at toplevel_closed time"
                 );
                 return;
@@ -683,7 +686,7 @@ pub(crate) fn handle_empty_workspace_if_triggered(
         TriggerOutcome::NoOp { reason: NoOpReason::StillOccupied { ws } } => {
             tracing::debug!(
                 closed_toplevel_id = %closed_id,
-                workspace_id = ?ws,
+                workspace_id = ws,
                 case = "still_occupied",
                 "jump trigger no-op"
             );
@@ -692,7 +695,7 @@ pub(crate) fn handle_empty_workspace_if_triggered(
             tracing::debug!(
                 closed_toplevel_id = %closed_id,
                 group_id,
-                source_workspace_id = ?source,
+                source_workspace_id = source,
                 case = "no_target",
                 "jump trigger no-op"
             );
@@ -700,7 +703,7 @@ pub(crate) fn handle_empty_workspace_if_triggered(
         TriggerOutcome::NoOp { reason: NoOpReason::NoGroup { ws } } => {
             tracing::warn!(
                 closed_toplevel_id = %closed_id,
-                workspace_id = ?ws,
+                workspace_id = ws,
                 case = "no_group",
                 "jump trigger no-op: workspace orphaned from group (anomalous)"
             );

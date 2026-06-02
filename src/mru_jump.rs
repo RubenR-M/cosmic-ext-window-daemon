@@ -176,8 +176,14 @@ pub fn evaluate_trigger(input: &TriggerInput<'_>) -> TriggerOutcome {
         };
     }
 
-    // Fallback (single-handle path — should not be reached if loop ran).
-    TriggerOutcome::NoOp { reason: last_single_reason.unwrap_or(NoOpReason::NoWorkspace) }
+    // Unreachable: single-handle path always returns inside the loop body
+    // (every branch either returns Jump or returns NoOp without setting
+    // last_single_reason). The multi-handle path returns above via the
+    // MultiWorkspaceNoMatch branch. last_single_reason is therefore never
+    // observed and this expression is structurally dead — make the invariant
+    // explicit so future regressions trip immediately.
+    let _ = last_single_reason;
+    unreachable!("single-handle loop always returns; multi-handle is handled above")
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +751,7 @@ mod tests {
     /// The guards are verified by reading src/wayland/{workspace,toplevel}.rs
     /// which use `if self.config.jump_on_empty` before any MRU-related call.
     #[test]
-    fn feature_off_config_means_evaluate_trigger_is_never_called() {
+    fn feature_off_config_default_is_false() {
         let config_off = crate::config::from_env_source(|_| None).unwrap();
         assert!(!config_off.jump_on_empty);
         // The actual feature-off guards are at:
