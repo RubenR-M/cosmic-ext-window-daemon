@@ -460,6 +460,265 @@ fn register_activate_with_verification(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// MRU jump on empty workspace (T-MRU-006 / FR-MRU-001..012)
+// ---------------------------------------------------------------------------
+
+/// Evaluate whether the just-closed toplevel's workspace should trigger a jump
+/// to the most-recently-visited workspace in the same group.
+///
+/// Called from `ToplevelInfoHandler::toplevel_closed` when `config.jump_on_empty`
+/// is true. The closed toplevel's `ToplevelInfo` is still accessible at call time
+/// (cosmic-client-toolkit-0.2.0/src/toplevel_info.rs:361-370).
+///
+/// # Borrow choreography (design §4.2)
+/// Mirrors `execute_place`: collect owned data (IDs, occupancy, target_id) from
+/// immutable borrows first, release them, then resolve `target_id → &ExtWorkspaceHandleV1`
+/// for the final `register_activate_with_verification` call.
+///
+/// # RUST_LOG=info behavior
+/// A successful jump emits `tracing::info!` with source/target/group/cause fields.
+/// No-op cases emit `tracing::debug!` — journals stay clean at the default info level.
+pub(crate) fn handle_empty_workspace_if_triggered(
+    app: &mut crate::state::AppData,
+    closed_id: &wayland_client::backend::ObjectId,
+) {
+    use crate::wayland::workspace::workspace_is_active;
+    use crate::mru_jump::{WorkspaceMeta, TriggerInput, TriggerOutcome, NoOpReason, evaluate_trigger};
+    use std::collections::HashMap;
+
+    // Step 1 — pull closed toplevel's workspace handle set.
+    // ToplevelInfo is still present at call time per toolkit source §361-370:
+    // `toplevel_closed` is invoked BEFORE the toolkit removes ToplevelData.
+    let closed_ws_handles: Vec<wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1::ExtWorkspaceHandleV1> = {
+        let info = app
+            .toplevel_info_state
+            .toplevels()
+            .find(|t| t.foreign_toplevel.id() == *closed_id);
+        match info {
+            Some(i) => i.workspace.iter().cloned().collect(),
+            None => {
+                // Should not happen per toolkit guarantee, but handle gracefully.
+                // Distinct from the D9 NoWorkspace case (ToplevelData found but its
+                // workspace set is empty): this path means ToplevelData itself was
+                // missing at handler call time.
+                tracing::debug!(
+                    closed_toplevel_id = %closed_id,
+                    case = "toplevel_not_found",
+                    "jump trigger no-op: ToplevelInfo not found at toplevel_closed time"
+                );
+                return;
+            }
+        }
+    };
+
+    // Step 2 — collect owned data from immutable borrows to build TriggerInput.
+
+    // WorkspaceMeta slice: one entry per workspace the closing toplevel was on.
+    let closed_workspaces: Vec<WorkspaceMeta> = closed_ws_handles
+        .iter()
+        .map(|h| WorkspaceMeta {
+            id: h.id().protocol_id() as u64,
+            coordinates: app
+                .workspace_state
+                .workspaces()
+                .find(|w| w.handle.id() == h.id())
+                .map(|w| w.coordinates.clone())
+                .unwrap_or_default(),
+        })
+        .collect();
+
+    // is_active per workspace.
+    let is_active: HashMap<crate::ids::WorkspaceId, bool> = closed_ws_handles
+        .iter()
+        .map(|h| {
+            let active = app
+                .workspace_state
+                .workspaces()
+                .find(|w| w.handle.id() == h.id())
+                .map(workspace_is_active)
+                .unwrap_or(false);
+            (h.id().protocol_id() as u64, active)
+        })
+        .collect();
+
+    // Occupied-excluding-closed count per workspace.
+    let occupied_excluding_closed: HashMap<crate::ids::WorkspaceId, usize> = closed_ws_handles
+        .iter()
+        .map(|h| {
+            let count = app
+                .toplevel_info_state
+                .toplevels()
+                .filter(|t| {
+                    t.foreign_toplevel.id() != *closed_id
+                        && t.workspace.iter().any(|w| w.id() == h.id())
+                })
+                .count();
+            (h.id().protocol_id() as u64, count)
+        })
+        .collect();
+
+    // Group id per workspace (None if orphaned).
+    let group_id_for: HashMap<crate::ids::WorkspaceId, Option<u64>> = closed_ws_handles
+        .iter()
+        .map(|h| {
+            let gid = app
+                .workspace_state
+                .workspace_groups()
+                .find(|g| g.workspaces.iter().any(|wh| wh.id() == h.id()))
+                .map(|g| g.handle.id().protocol_id() as u64);
+            (h.id().protocol_id() as u64, gid)
+        })
+        .collect();
+
+    // All workspaces per group + per-group occupied set (excluding closing handle).
+    let occupied_ws_ids: std::collections::HashSet<wayland_client::backend::ObjectId> = app
+        .toplevel_info_state
+        .toplevels()
+        .filter(|t| t.foreign_toplevel.id() != *closed_id)
+        .flat_map(|t| t.workspace.iter().map(|w| w.id()))
+        .collect();
+
+    let mut group_workspaces: HashMap<u64, Vec<WorkspaceMeta>> = HashMap::new();
+    let mut group_occupied: HashMap<u64, std::collections::HashSet<crate::ids::WorkspaceId>> =
+        HashMap::new();
+
+    for gid_opt in group_id_for.values().flatten() {
+        let gid = *gid_opt;
+        if group_workspaces.contains_key(&gid) {
+            continue;
+        }
+        let g = app
+            .workspace_state
+            .workspace_groups()
+            .find(|g| g.handle.id().protocol_id() as u64 == gid);
+        if let Some(g) = g {
+            let metas: Vec<WorkspaceMeta> = app
+                .workspace_state
+                .workspaces()
+                .filter(|w| g.workspaces.contains(&w.handle))
+                .map(|w| WorkspaceMeta {
+                    id: w.handle.id().protocol_id() as u64,
+                    coordinates: w.coordinates.clone(),
+                })
+                .collect();
+            let occ: std::collections::HashSet<crate::ids::WorkspaceId> = metas
+                .iter()
+                .filter(|m| {
+                    app.workspace_state
+                        .workspaces()
+                        .find(|w| w.handle.id().protocol_id() as u64 == m.id)
+                        .map(|w| occupied_ws_ids.contains(&w.handle.id()))
+                        .unwrap_or(false)
+                })
+                .map(|m| m.id)
+                .collect();
+            group_occupied.insert(gid, occ);
+            group_workspaces.insert(gid, metas);
+        }
+    }
+
+    // Step 3 — call the pure evaluator.
+    let input = TriggerInput {
+        closed_workspaces: &closed_workspaces,
+        is_active: &is_active,
+        occupied_excluding_closed: &occupied_excluding_closed,
+        group_id_for: &group_id_for,
+        group_workspaces: &group_workspaces,
+        group_occupied: &group_occupied,
+        recent_mru: &app.recent_workspaces,
+    };
+
+    let outcome = evaluate_trigger(&input);
+
+    // Step 4 — dispatch outcome. All immutable borrows released before activation.
+    match outcome {
+        TriggerOutcome::Jump { source, target, group_id } => {
+            // Resolve target WorkspaceId → &ExtWorkspaceHandleV1.
+            let target_ws_handle = app
+                .workspace_state
+                .workspaces()
+                .find(|w| w.handle.id().protocol_id() as u64 == target)
+                .map(|w| w.handle.clone());
+
+            match target_ws_handle {
+                Some(h) => match register_activate_with_verification(app, &h) {
+                    Ok(()) => {
+                        tracing::info!(
+                            source_workspace_id = source,
+                            target_workspace_id = target,
+                            group_id,
+                            cause = "last_toplevel_closed",
+                            "jumped to MRU/fallback workspace"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            source_workspace_id = source,
+                            target_workspace_id = target,
+                            "jump activation failed"
+                        );
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        workspace_id = target,
+                        "jump target workspace handle not found; skipping activation"
+                    );
+                }
+            }
+        }
+        TriggerOutcome::NoOp { reason: NoOpReason::NoWorkspace } => {
+            tracing::debug!(
+                closed_toplevel_id = %closed_id,
+                case = "no_workspace",
+                "jump trigger no-op"
+            );
+        }
+        TriggerOutcome::NoOp { reason: NoOpReason::NotActive } => {
+            tracing::debug!(
+                closed_toplevel_id = %closed_id,
+                case = "not_active",
+                "jump trigger no-op"
+            );
+        }
+        TriggerOutcome::NoOp { reason: NoOpReason::StillOccupied { ws } } => {
+            tracing::debug!(
+                closed_toplevel_id = %closed_id,
+                workspace_id = ws,
+                case = "still_occupied",
+                "jump trigger no-op"
+            );
+        }
+        TriggerOutcome::NoOp { reason: NoOpReason::NoTarget { group_id, source } } => {
+            tracing::debug!(
+                closed_toplevel_id = %closed_id,
+                group_id,
+                source_workspace_id = source,
+                case = "no_target",
+                "jump trigger no-op"
+            );
+        }
+        TriggerOutcome::NoOp { reason: NoOpReason::NoGroup { ws } } => {
+            tracing::warn!(
+                closed_toplevel_id = %closed_id,
+                workspace_id = ws,
+                case = "no_group",
+                "jump trigger no-op: workspace orphaned from group (anomalous)"
+            );
+        }
+        TriggerOutcome::NoOp { reason: NoOpReason::MultiWorkspaceNoMatch { handle_count } } => {
+            tracing::debug!(
+                closed_toplevel_id = %closed_id,
+                handle_count,
+                case = "multi_workspace_no_match",
+                "jump trigger no-op"
+            );
+        }
+    }
+}
+
 fn emit_verify_event(
     event: crate::verify::VerifyEvent,
     handle_id: u64,

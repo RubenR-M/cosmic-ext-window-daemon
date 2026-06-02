@@ -120,6 +120,21 @@ pub struct AppData {
     /// WorkspaceHandler::done() cycle for the new workspace to appear before
     /// degrading to next-free placement.
     pub pending_placements: Vec<crate::runtime::PendingPlacement>,
+
+    // -----------------------------------------------------------------------
+    // MRU-jump-on-empty (T-MRU-003 / D3 + D4)
+    //
+    // Gated on Config.jump_on_empty (D5): when false, neither field is mutated
+    // after construction. Both dropped wholesale on reconnect (initial-impl D11 / D7).
+    // -----------------------------------------------------------------------
+    /// Most-recently-visited workspace IDs, front = most recent.
+    /// Global deque (not per-group); intra-group filtering happens at query time
+    /// in `mru_jump::select_jump_target` per D8. Capped at `MRU_CAP` = 16.
+    pub recent_workspaces: std::collections::VecDeque<crate::ids::WorkspaceId>,
+    /// Last observed active workspace per group.
+    /// Key: `group.handle.id().protocol_id() as u64`
+    /// Value: `workspace.handle.id().protocol_id() as u64`
+    pub last_known_active: std::collections::HashMap<u64, crate::ids::WorkspaceId>,
 }
 
 impl AppData {

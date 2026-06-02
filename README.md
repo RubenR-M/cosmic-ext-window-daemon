@@ -56,6 +56,7 @@ All configuration is via environment variables, read at startup. Unknown or malf
 | `WORKSPACE_OUTPUT` | (none) | Override: name of the output whose workspace group receives all toplevels (e.g. `DP-1`). Falls back to per-toplevel output selection when the named output is absent; emits WARN at most once. |
 | `EXCLUDED_APP_IDS` | (none) | Comma-separated `app_id` values to skip (case-sensitive, e.g. `org.kde.dolphin,foot`). |
 | `EXCLUDED_TITLE_REGEX` | (none) | Regular expression matched against toplevel titles. Toplevels whose title matches are skipped. Invalid regex exits 1 at startup. |
+| `JUMP_ON_EMPTY` | `0` | If `1`, when the last window on your active workspace closes the daemon automatically activates the most-recently-visited workspace in the same group that still has windows. Falls back to the workspace with the lowest index **that still has windows** when no MRU entry is available. Default `0` (opt-in). |
 
 ### Drop-in override pattern
 
@@ -92,6 +93,12 @@ On compositor disconnect, the daemon drops all Wayland state and retries with a 
 
 After a successful reconnect the backoff cursor resets to 1s.
 
+### MRU jump on empty workspace
+
+When `JUMP_ON_EMPTY=1`, the daemon watches for the moment your active workspace becomes empty (the last window on it closes). At that point it activates the most-recently-visited workspace in the same group that still has at least one window. If no such MRU entry exists (e.g. fresh daemon start with no prior workspace switches), it falls back to the workspace with the lowest index **that still has windows** in the group. If every other workspace in the group is also empty, no activation is issued and the compositor keeps its current view.
+
+The feature is scoped to the group that owns the closing window's workspace — a close on monitor 1 never triggers a jump on monitor 2. MRU history is reset on compositor reconnect (the daemon drops all state on disconnect per its reconnect policy). Enable `RUST_LOG=debug` to see per-close diagnostic output; at the default `info` level only successful jumps are logged.
+
 ### Signal handling (FR-022)
 
 `SIGTERM` and `SIGINT` trigger clean shutdown within ~50ms even during a backoff sleep. The systemd unit declares `SuccessExitStatus=SIGTERM SIGINT` so `systemctl --user stop` reports `Result=success`.
@@ -124,6 +131,14 @@ Check `journalctl --user -fu cosmic-ext-window-daemon.service`. The daemon logs 
 - Does the toplevel have any output advertised? (Skipped with WARN if not.)
 - Is the `zcosmic_toplevel_info_v1` protocol present? (Daemon exits 1 at startup if not.)
 
+### Jump-on-empty not firing
+
+Check that `JUMP_ON_EMPTY=1` is set in the systemd unit's `Environment=` directive (via `systemctl --user edit cosmic-ext-window-daemon.service`). The variable is not in `PassEnvironment` and will not be inherited from your shell session automatically.
+
+Enable `RUST_LOG=debug` to see a per-close diagnostic line such as `case="still_occupied"` (other windows remain on the workspace) or `case="not_active"` (the closed window was on a background workspace). A successful jump emits an `INFO` line with `source_workspace_id` and `target_workspace_id` fields.
+
+If jumps are attempted but the compositor does not switch the view, check whether your compositor version honors `ext_workspace_handle_v1::activate`. The daemon uses the same activation path as `SWITCH_TO_WORKSPACE=1`.
+
 ### Verifying the systemd unit file
 
 Run after `make install` (the binary path in `ExecStart` must exist for `systemd-analyze verify` to succeed):
@@ -138,8 +153,8 @@ make verify-unit   # runs: systemd-analyze verify contrib/cosmic-ext-window-daem
 # Build
 cargo build --release --locked
 
-# Full test suite — 101 effective tests
-# (100 unit tests + 1 trybuild compile_fail integration test
+# Full test suite — ~125 effective tests
+# (124+ unit tests + 1 trybuild compile_fail integration test
 #  with 3 sub-cases that enforce the D15 Layer 1 commit gate)
 cargo test --locked
 
@@ -151,12 +166,13 @@ cargo clippy --all-targets -- -D warnings
 
 | File | Responsibility |
 |------|----------------|
-| `src/config.rs` | Pure config parsing from env (21 tests) |
+| `src/config.rs` | Pure config parsing from env (25 tests) |
 | `src/placement.rs` | Pure placement decision engine (24 tests) |
+| `src/mru_jump.rs` | Pure MRU jump decision logic: `select_jump_target`, `record_mru_transition`, `detect_transitions_and_update` (20 tests) |
 | `src/verify.rs` | Two-tier workspace activation verifier (17 tests) |
 | `src/reconnect.rs` | `BackoffState` + `Supervisor<F>` outer reconnect loop (13 tests) |
 | `src/app.rs` | `connect_and_run`: one Wayland session; `check_required_globals` (D8); `walk_for_io_errno` + `map_calloop_error` (A22) |
-| `src/runtime.rs` | Placement pipeline integration |
+| `src/runtime.rs` | Placement pipeline integration + `handle_empty_workspace_if_triggered` |
 | `src/wayland/` | Smithay handlers + cosmic-client-toolkit delegate macros |
 | `src/wayland/workspace.rs` | `WorkspaceManager::transaction` — the only authorized call site for raw workspace protocol methods (D15 Layer 1) |
 | `contrib/cosmic-ext-window-daemon.service` | systemd user unit |
